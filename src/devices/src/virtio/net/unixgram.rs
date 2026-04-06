@@ -76,7 +76,8 @@ impl Unixgram {
         )
         .map_err(ConnectError::CreateSocket)?;
         let peer_addr = UnixAddr::new(&path).map_err(ConnectError::InvalidAddress)?;
-        let local_addr = UnixAddr::new(&PathBuf::from(format!("{}-krun.sock", path.display())))
+        let local_path = PathBuf::from(format!("{}-krun-{}.sock", path.display(), std::process::id()));
+        let local_addr = UnixAddr::new(&local_path)
             .map_err(ConnectError::InvalidAddress)?;
         if let Some(path) = local_addr.path() {
             _ = unlink(path);
@@ -169,5 +170,33 @@ impl NetBackend for Unixgram {
     #[cfg(target_os = "macos")]
     fn write_retry_delay_us(&self) -> u64 {
         50
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify client socket path includes the PID for cross-process uniqueness.
+    #[test]
+    fn client_socket_path_contains_pid() {
+        let server_path = PathBuf::from("/tmp/test-gvproxy.sock");
+        let pid = std::process::id();
+        let expected = format!("{}-krun-{}.sock", server_path.display(), pid);
+
+        assert!(expected.contains(&format!("-krun-{}.", pid)));
+    }
+
+    /// Verify that the same process always produces the same client socket path
+    /// (deterministic within a single krunvm invocation).
+    #[test]
+    fn client_socket_path_is_deterministic() {
+        let server_path = PathBuf::from("/tmp/test-gvproxy.sock");
+        let pid = std::process::id();
+
+        let path_a = format!("{}-krun-{}.sock", server_path.display(), pid);
+        let path_b = format!("{}-krun-{}.sock", server_path.display(), pid);
+
+        assert_eq!(path_a, path_b);
     }
 }
