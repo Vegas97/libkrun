@@ -192,6 +192,11 @@ impl VirtioDevice for Net {
             ActivateError::BadActivate
         })?;
 
+        let stop_fd = self.worker_stopfd.try_clone().map_err(|e| {
+            error!("Failed to clone worker stop eventfd: {e:?}");
+            ActivateError::BadActivate
+        })?;
+
         match NetWorker::new(
             rx_q,
             tx_q,
@@ -199,7 +204,7 @@ impl VirtioDevice for Net {
             mem.clone(),
             self.acked_features,
             self.cfg_backend.clone(),
-            self.worker_stopfd.try_clone().unwrap(),
+            stop_fd,
         ) {
             Ok(worker) => {
                 self.worker_thread = Some(worker.run());

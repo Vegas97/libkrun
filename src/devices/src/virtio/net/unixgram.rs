@@ -5,7 +5,7 @@ use nix::sys::socket::{
 };
 use nix::unistd::unlink;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
 use super::write_virtio_net_hdr;
@@ -25,6 +25,14 @@ const SOCKET_SNDBUF: usize = MAX_BUFFER_SIZE - VNET_HDR_LEN;
 const SOCKET_SNDBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
 
 const SOCKET_RCVBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
+
+fn client_socket_path(server_path: &Path) -> PathBuf {
+    PathBuf::from(format!(
+        "{}-krun-{}.sock",
+        server_path.display(),
+        std::process::id()
+    ))
+}
 
 pub struct Unixgram {
     fd: OwnedFd,
@@ -76,7 +84,7 @@ impl Unixgram {
         )
         .map_err(ConnectError::CreateSocket)?;
         let peer_addr = UnixAddr::new(&path).map_err(ConnectError::InvalidAddress)?;
-        let local_path = PathBuf::from(format!("{}-krun-{}.sock", path.display(), std::process::id()));
+        let local_path = client_socket_path(&path);
         let local_addr = UnixAddr::new(&local_path)
             .map_err(ConnectError::InvalidAddress)?;
         if let Some(path) = local_addr.path() {
@@ -177,25 +185,26 @@ impl NetBackend for Unixgram {
 mod tests {
     use super::*;
 
-    /// Verify client socket path includes the PID for cross-process uniqueness.
+    /// Verify the production client_socket_path() includes the PID for cross-process uniqueness.
     #[test]
     fn client_socket_path_contains_pid() {
         let server_path = PathBuf::from("/tmp/test-gvproxy.sock");
+        let result = client_socket_path(&server_path);
         let pid = std::process::id();
-        let expected = format!("{}-krun-{}.sock", server_path.display(), pid);
 
-        assert!(expected.contains(&format!("-krun-{}.", pid)));
+        assert!(
+            result.to_str().unwrap().contains(&format!("-krun-{}.", pid)),
+            "path must contain PID: {result:?}"
+        );
     }
 
-    /// Verify that the same process always produces the same client socket path
-    /// (deterministic within a single krunvm invocation).
+    /// Verify that client_socket_path() is deterministic within a single process.
     #[test]
     fn client_socket_path_is_deterministic() {
         let server_path = PathBuf::from("/tmp/test-gvproxy.sock");
-        let pid = std::process::id();
 
-        let path_a = format!("{}-krun-{}.sock", server_path.display(), pid);
-        let path_b = format!("{}-krun-{}.sock", server_path.display(), pid);
+        let path_a = client_socket_path(&server_path);
+        let path_b = client_socket_path(&server_path);
 
         assert_eq!(path_a, path_b);
     }

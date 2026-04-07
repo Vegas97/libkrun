@@ -30,8 +30,8 @@ fn write_virtio_net_hdr(buf: &mut [u8]) -> usize {
 
 /// Virtio-net header field offsets (virtio_net_hdr_v1)
 const VNET_FLAGS_OFFSET: usize = 0;
-const VNET_CSUM_START_OFFSET: usize = 6;
-const VNET_CSUM_OFFSET_OFFSET: usize = 8;
+pub(super) const VNET_CSUM_START_OFFSET: usize = 6;
+pub(super) const VNET_CSUM_OFFSET_OFFSET: usize = 8;
 
 const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
 

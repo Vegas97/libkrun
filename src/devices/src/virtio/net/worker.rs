@@ -8,7 +8,7 @@ use crate::virtio::{DeviceQueue, InterruptTransport};
 
 use super::backend::{NetBackend, ReadError, WriteError};
 use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
-use super::{finalize_checksum, VNET_HDR_LEN};
+use super::{finalize_checksum, VNET_CSUM_OFFSET_OFFSET, VNET_CSUM_START_OFFSET, VNET_HDR_LEN};
 
 #[cfg(target_os = "macos")]
 use std::os::fd::RawFd;
@@ -369,8 +369,8 @@ impl NetWorker {
             if read_count > VNET_HDR_LEN + 14 {
                 let flags = self.tx_frame_buf[0];
                 let gso_type = self.tx_frame_buf[1];
-                let csum_start = u16::from_le_bytes([self.tx_frame_buf[2], self.tx_frame_buf[3]]);
-                let csum_offset = u16::from_le_bytes([self.tx_frame_buf[4], self.tx_frame_buf[5]]);
+                let csum_start = u16::from_le_bytes([self.tx_frame_buf[VNET_CSUM_START_OFFSET], self.tx_frame_buf[VNET_CSUM_START_OFFSET + 1]]);
+                let csum_offset = u16::from_le_bytes([self.tx_frame_buf[VNET_CSUM_OFFSET_OFFSET], self.tx_frame_buf[VNET_CSUM_OFFSET_OFFSET + 1]]);
                 let eth = &self.tx_frame_buf[VNET_HDR_LEN..];
                 log::debug!(
                     "TX frame: len={} vnet_flags={:#x} gso={} csum_start={} csum_off={} \
