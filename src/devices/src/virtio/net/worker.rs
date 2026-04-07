@@ -8,14 +8,15 @@ use crate::virtio::{DeviceQueue, InterruptTransport};
 
 use super::backend::{NetBackend, ReadError, WriteError};
 use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
-use super::VNET_HDR_LEN;
+use super::{finalize_checksum, VNET_CSUM_OFFSET_OFFSET, VNET_CSUM_START_OFFSET, VNET_HDR_LEN};
 
 #[cfg(target_os = "macos")]
 use std::os::fd::RawFd;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::EventFd;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 pub struct NetWorker {
@@ -34,6 +35,8 @@ pub struct NetWorker {
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
+
+    stop_fd: EventFd,
 }
 
 impl NetWorker {
@@ -44,6 +47,7 @@ impl NetWorker {
         mem: GuestMemoryMmap,
         _vnet_features: u64,
         cfg_backend: VirtioNetBackend,
+        stop_fd: EventFd,
     ) -> Result<Self, ConnectError> {
         let backend = match cfg_backend {
             VirtioNetBackend::UnixstreamFd(fd) => {
@@ -86,14 +90,15 @@ impl NetWorker {
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
+
+            stop_fd,
         })
     }
 
-    pub fn run(self) {
+    pub fn run(self) -> std::io::Result<JoinHandle<()>> {
         thread::Builder::new()
             .name("virtio-net worker".into())
             .spawn(|| self.work())
-            .unwrap();
     }
 
     fn work(mut self) {
@@ -103,6 +108,7 @@ impl NetWorker {
         let virtq_rx_ev_fd = self.rx_q.event.as_raw_fd();
         let virtq_tx_ev_fd = self.tx_q.event.as_raw_fd();
         let backend_socket = self.backend.raw_socket_fd();
+        let stop_ev_fd = self.stop_fd.as_raw_fd();
 
         let epoll = Epoll::new().unwrap();
 
@@ -124,6 +130,11 @@ impl NetWorker {
                 backend_socket as u64,
             ),
         );
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            stop_ev_fd,
+            &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
+        );
 
         loop {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
@@ -133,6 +144,11 @@ impl NetWorker {
                         let source = event.fd();
                         let event_set = event.event_set();
                         match event_set {
+                            EventSet::IN if source == stop_ev_fd => {
+                                debug!("virtio-net: stopping worker thread");
+                                let _ = self.stop_fd.read();
+                                return;
+                            }
                             EventSet::IN if source == virtq_rx_ev_fd => {
                                 self.process_rx_queue_event();
                             }
@@ -195,7 +211,7 @@ impl NetWorker {
             log::error!("Failed to process rx: {e:?} (triggered by queue event)")
         };
         if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
+            error!("error enabling queue notifications: {e:?}");
         }
     }
 
@@ -209,14 +225,14 @@ impl NetWorker {
     }
 
     pub(crate) fn process_backend_socket_readable(&mut self) {
-        if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
+        if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
             error!("error disabling queue notifications: {e:?}");
         }
         if let Err(e) = self.process_rx() {
             log::error!("Failed to process rx: {e:?} (triggered by backend socket readable)");
         };
-        if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
+        if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
+            error!("error enabling queue notifications: {e:?}");
         }
     }
 
@@ -347,6 +363,32 @@ impl NetWorker {
             }
 
             self.tx_frame_len = read_count;
+
+            // Trace logging: dump virtio-net header flags and Ethernet header from TX frame
+            if read_count > VNET_HDR_LEN + 14 {
+                let flags = self.tx_frame_buf[0];
+                let gso_type = self.tx_frame_buf[1];
+                let csum_start = u16::from_le_bytes([self.tx_frame_buf[VNET_CSUM_START_OFFSET], self.tx_frame_buf[VNET_CSUM_START_OFFSET + 1]]);
+                let csum_offset = u16::from_le_bytes([self.tx_frame_buf[VNET_CSUM_OFFSET_OFFSET], self.tx_frame_buf[VNET_CSUM_OFFSET_OFFSET + 1]]);
+                let eth = &self.tx_frame_buf[VNET_HDR_LEN..];
+                log::debug!(
+                    "TX frame: len={} vnet_flags={:#x} gso={} csum_start={} csum_off={} \
+                     dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} \
+                     src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ethertype={:02x}{:02x}",
+                    read_count - VNET_HDR_LEN,
+                    flags, gso_type, csum_start, csum_offset,
+                    eth[0], eth[1], eth[2], eth[3], eth[4], eth[5],
+                    eth[6], eth[7], eth[8], eth[9], eth[10], eth[11],
+                    eth[12], eth[13],
+                );
+            }
+
+            // Finalize checksum offload before the backend strips the virtio-net header.
+            // The guest may have set VIRTIO_NET_HDR_F_NEEDS_CSUM with only a pseudo-header
+            // checksum in the frame. Unix socket backends (gvproxy, passt) don't have a
+            // kernel networking stack to complete it — we must do it here.
+            finalize_checksum(&mut self.tx_frame_buf[..read_count]);
+
             match self
                 .backend
                 .write_frame(VNET_HDR_LEN, &mut self.tx_frame_buf[..read_count])
@@ -471,5 +513,57 @@ impl NetWorker {
     fn read_into_rx_frame_buf_from_backend(&mut self) -> result::Result<(), ReadError> {
         self.rx_frame_buf_len = self.backend.read_frame(&mut self.rx_frame_buf)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::virtio::queue::tests::VirtQueue;
+    use virtio_bindings::virtio_ring::VRING_USED_F_NO_NOTIFY;
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    /// The correct virtio pattern (disable → process → enable) must leave
+    /// notifications ENABLED after completion, so the guest can wake the
+    /// device when it adds new buffers to the available ring.
+    ///
+    /// This is the pattern used by process_rx_queue_event, block/worker,
+    /// and fs/worker throughout the codebase.
+    #[test]
+    fn correct_notification_ordering_leaves_notifications_enabled() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let mut queue = vq.create_queue();
+
+        // Simulate: disable → (process) → enable
+        queue.disable_notification(&mem).unwrap();
+        let _ = queue.enable_notification(&mem).unwrap();
+
+        // Notifications should be ON (flags cleared)
+        assert_eq!(
+            vq.used.flags.get(),
+            0,
+            "correct ordering must leave notifications enabled"
+        );
+    }
+
+    /// The inverted pattern (enable → process → disable) leaves notifications
+    /// DISABLED after completion. This is the bug in process_backend_socket_readable:
+    /// after process_rx() defers a frame, the guest cannot wake the worker to retry.
+    #[test]
+    fn inverted_notification_ordering_leaves_notifications_disabled() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let mut queue = vq.create_queue();
+
+        // Simulate: enable → (process) → disable  (THE BUG)
+        let _ = queue.enable_notification(&mem).unwrap();
+        queue.disable_notification(&mem).unwrap();
+
+        // Notifications are OFF — guest kicks are silently ignored
+        assert_eq!(
+            vq.used.flags.get(),
+            VRING_USED_F_NO_NOTIFY as u16,
+            "inverted ordering leaves notifications disabled"
+        );
     }
 }

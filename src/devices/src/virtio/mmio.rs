@@ -298,9 +298,9 @@ impl MmioTransport {
         // . Do not reset config_generation and keep it monotonically increasing
     }
 
-    fn activate(&mut self) {
+    fn activate(&mut self) -> bool {
         let Some(queues) = self.queues.take() else {
-            return;
+            return false;
         };
 
         let mut device_queues: Vec<DeviceQueue> = queues
@@ -315,9 +315,16 @@ impl MmioTransport {
         for dq in &mut device_queues {
             dq.queue.set_event_idx(event_idx_enabled);
         }
-        locked_device
+        if let Err(e) = locked_device
             .activate(self.mem.clone(), self.interrupt.clone(), device_queues)
-            .expect("Failed to activate device");
+        {
+            error!("Failed to activate device: {e:?}");
+            drop(locked_device);
+            // Restore queues so the device can be retried after reset.
+            self.queues = Some(Self::create_queues(&self.queue_config));
+            return false;
+        }
+        true
     }
 
     /// Update device status according to the state machine defined by VirtIO Spec 1.0.
@@ -344,8 +351,8 @@ impl MmioTransport {
             DRIVER_OK if self.device_status == (ACKNOWLEDGE | DRIVER | FEATURES_OK) => {
                 self.device_status = status;
                 let device_activated = self.locked_device().is_activated();
-                if !device_activated {
-                    self.activate();
+                if !device_activated && !self.activate() {
+                    self.device_status |= FAILED;
                 }
             }
             _ if (status & FAILED) != 0 => {
