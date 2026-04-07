@@ -595,6 +595,39 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
                 // Default to a conservative 512 MB window.
                 shm_size: Some(1 << 29),
                 allow_root_dir_delete: false,
+                read_only: false,
+            });
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+/// Sets a read-only root filesystem for the microVM. The FUSE server will reject
+/// all mutating operations (write, create, mkdir, etc.) with EROFS, and the guest
+/// kernel will mount the rootfs as read-only from boot.
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(not(feature = "tee"))]
+pub unsafe extern "C" fn krun_set_root_ro(ctx_id: u32, c_root_path: *const c_char) -> i32 {
+    let root_path = match CStr::from_ptr(c_root_path).to_str() {
+        Ok(root) => root,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    let fs_id = "/dev/root".to_string();
+    let shared_dir = root_path.to_string();
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            cfg.vmr.add_fs_device(FsDeviceConfig {
+                fs_id,
+                shared_dir,
+                shm_size: Some(1 << 29),
+                allow_root_dir_delete: false,
+                read_only: true,
             });
         }
         Entry::Vacant(_) => return -libc::ENOENT,
@@ -628,6 +661,7 @@ pub unsafe extern "C" fn krun_add_virtiofs(
                 shared_dir: path.to_string(),
                 shm_size: None,
                 allow_root_dir_delete: false,
+                read_only: false,
             });
         }
         Entry::Vacant(_) => return -libc::ENOENT,
@@ -662,6 +696,7 @@ pub unsafe extern "C" fn krun_add_virtiofs2(
                 shared_dir: path.to_string(),
                 shm_size: Some(shm_size.try_into().unwrap()),
                 allow_root_dir_delete: false,
+                read_only: false,
             });
         }
         Entry::Vacant(_) => return -libc::ENOENT,
@@ -2294,6 +2329,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                 // Default to a conservative 512 MB window.
                 shm_size: Some(1 << 29),
                 allow_root_dir_delete: true,
+                read_only: false,
             });
 
             ctx_cfg.set_block_root(device, fstype, options);
