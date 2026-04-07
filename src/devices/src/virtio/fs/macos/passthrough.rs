@@ -517,6 +517,8 @@ pub struct Config {
     /// Table of exported FDs to share with other subsystems. Not supported for macos.
     pub export_table: Option<ExportTable>,
     pub allow_root_dir_delete: bool,
+    /// When true, the FUSE server rejects all mutating operations with EROFS.
+    pub read_only: bool,
 }
 
 impl Default for Config {
@@ -532,6 +534,7 @@ impl Default for Config {
             export_fsid: 0,
             export_table: None,
             allow_root_dir_delete: false,
+            read_only: false,
         }
     }
 }

@@ -1054,6 +1054,20 @@ pub fn build_microvm(
         #[cfg(target_os = "macos")]
         _sender,
     )?;
+
+    // If the root filesystem is read-only, replace "rw" with "ro" in the kernel cmdline
+    // so the guest kernel mounts it read-only from boot.
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    if vm_resources
+        .fs
+        .first()
+        .is_some_and(|root_fs| root_fs.read_only)
+    {
+        let cmdline = vmm.kernel_cmdline.as_str().replace(" rw ", " ro ");
+        vmm.kernel_cmdline = kernel::cmdline::Cmdline::new(arch::CMDLINE_MAX_SIZE);
+        vmm.kernel_cmdline.insert_str(&cmdline).unwrap();
+    }
+
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
 
@@ -1903,6 +1917,7 @@ fn attach_fs_devices(
                 config.shared_dir.clone(),
                 exit_code.clone(),
                 config.allow_root_dir_delete,
+                config.read_only,
             )
             .unwrap(),
         ));

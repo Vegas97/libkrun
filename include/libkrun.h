@@ -110,6 +110,22 @@ int32_t krun_set_vm_config(uint32_t ctx_id, uint8_t num_vcpus, uint32_t ram_mib)
 int32_t krun_set_root(uint32_t ctx_id, const char *root_path);
 
 /**
+ * Sets a read-only root filesystem for the microVM. Not available in libkrun-SEV.
+ *
+ * The FUSE server will reject all mutating operations (write, create, mkdir,
+ * unlink, rename, etc.) with EROFS at the VMM level. The guest kernel will
+ * mount the rootfs as read-only from boot.
+ *
+ * Arguments:
+ *  "ctx_id"    - the configuration context ID.
+ *  "root_path" - a null-terminated string representing the path to be used as root.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_root_ro(uint32_t ctx_id, const char *root_path);
+
+/**
  * DEPRECATED. Use krun_add_disk instead.
  *
  * Sets the path to the disk image that contains the file-system to be used as root for the microVM.
