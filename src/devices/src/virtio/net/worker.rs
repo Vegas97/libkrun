@@ -95,11 +95,10 @@ impl NetWorker {
         })
     }
 
-    pub fn run(self) -> JoinHandle<()> {
+    pub fn run(self) -> std::io::Result<JoinHandle<()>> {
         thread::Builder::new()
             .name("virtio-net worker".into())
             .spawn(|| self.work())
-            .unwrap()
     }
 
     fn work(mut self) {

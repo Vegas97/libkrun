@@ -207,7 +207,10 @@ impl VirtioDevice for Net {
             stop_fd,
         ) {
             Ok(worker) => {
-                self.worker_thread = Some(worker.run());
+                self.worker_thread = Some(worker.run().map_err(|e| {
+                    error!("Failed to spawn virtio-net worker thread: {e:?}");
+                    ActivateError::BadActivate
+                })?);
                 self.device_state = DeviceState::Activated(mem, interrupt);
                 Ok(())
             }
