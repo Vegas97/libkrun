@@ -13,9 +13,10 @@ use super::{finalize_checksum, VNET_HDR_LEN};
 #[cfg(target_os = "macos")]
 use std::os::fd::RawFd;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::EventFd;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 pub struct NetWorker {
@@ -34,6 +35,8 @@ pub struct NetWorker {
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
+
+    stop_fd: EventFd,
 }
 
 impl NetWorker {
@@ -44,6 +47,7 @@ impl NetWorker {
         mem: GuestMemoryMmap,
         _vnet_features: u64,
         cfg_backend: VirtioNetBackend,
+        stop_fd: EventFd,
     ) -> Result<Self, ConnectError> {
         let backend = match cfg_backend {
             VirtioNetBackend::UnixstreamFd(fd) => {
@@ -86,14 +90,16 @@ impl NetWorker {
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
+
+            stop_fd,
         })
     }
 
-    pub fn run(self) {
+    pub fn run(self) -> JoinHandle<()> {
         thread::Builder::new()
             .name("virtio-net worker".into())
             .spawn(|| self.work())
-            .unwrap();
+            .unwrap()
     }
 
     fn work(mut self) {
@@ -103,6 +109,7 @@ impl NetWorker {
         let virtq_rx_ev_fd = self.rx_q.event.as_raw_fd();
         let virtq_tx_ev_fd = self.tx_q.event.as_raw_fd();
         let backend_socket = self.backend.raw_socket_fd();
+        let stop_ev_fd = self.stop_fd.as_raw_fd();
 
         let epoll = Epoll::new().unwrap();
 
@@ -124,6 +131,11 @@ impl NetWorker {
                 backend_socket as u64,
             ),
         );
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            stop_ev_fd,
+            &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
+        );
 
         loop {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
@@ -133,6 +145,11 @@ impl NetWorker {
                         let source = event.fd();
                         let event_set = event.event_set();
                         match event_set {
+                            EventSet::IN if source == stop_ev_fd => {
+                                debug!("virtio-net: stopping worker thread");
+                                let _ = self.stop_fd.read();
+                                return;
+                            }
                             EventSet::IN if source == virtq_rx_ev_fd => {
                                 self.process_rx_queue_event();
                             }
