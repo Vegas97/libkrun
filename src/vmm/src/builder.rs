@@ -1063,7 +1063,13 @@ pub fn build_microvm(
         .first()
         .is_some_and(|root_fs| root_fs.read_only)
     {
-        let cmdline = vmm.kernel_cmdline.as_str().replace(" rw ", " ro ");
+        let cmdline = vmm
+            .kernel_cmdline
+            .as_str()
+            .split_whitespace()
+            .map(|tok| if tok == "rw" { "ro" } else { tok })
+            .collect::<Vec<_>>()
+            .join(" ");
         vmm.kernel_cmdline = kernel::cmdline::Cmdline::new(arch::CMDLINE_MAX_SIZE);
         vmm.kernel_cmdline.insert_str(&cmdline).unwrap();
     }

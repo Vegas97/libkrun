@@ -617,6 +617,9 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
 #[no_mangle]
 #[cfg(not(feature = "tee"))]
 pub unsafe extern "C" fn krun_set_root_ro(ctx_id: u32, c_root_path: *const c_char) -> i32 {
+    if c_root_path.is_null() {
+        return -libc::EINVAL;
+    }
     let root_path = match CStr::from_ptr(c_root_path).to_str() {
         Ok(root) => root,
         Err(_) => return -libc::EINVAL,
