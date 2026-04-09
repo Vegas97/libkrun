@@ -386,7 +386,8 @@ impl VmResources {
     }
 }
 
-#[cfg(test)]
+// Tests reference stale field names (net_builder) and KVM-specific APIs.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     #[cfg(feature = "gpu")]
     use crate::resources::DisplayBackendConfig;

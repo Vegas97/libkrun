@@ -2372,7 +2372,8 @@ fn attach_snd_device(vmm: &mut Vmm, intc: IrqChip) -> std::result::Result<(), St
     Ok(())
 }
 
-#[cfg(test)]
+// Builder tests reference KVM-specific APIs not available on macOS/HVF.
+#[cfg(all(test, target_os = "linux"))]
 pub mod tests {
     use super::*;
     use crate::vmm_config::kernel_bundle::KernelBundle;
