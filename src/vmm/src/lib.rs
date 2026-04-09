@@ -15,6 +15,9 @@ extern crate log;
 
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
+/// Control socket for runtime VM management.
+#[cfg(not(feature = "tee"))]
+pub mod control_socket;
 pub(crate) mod device_manager;
 /// Resource store for configured microVM resources.
 pub mod resources;

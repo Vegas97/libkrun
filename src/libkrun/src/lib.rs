@@ -166,6 +166,8 @@ struct ContextConfig {
     vmm_gid: Option<libc::gid_t>,
     #[cfg(not(feature = "tee"))]
     initial_balloon_target: Option<u32>,
+    #[cfg(not(feature = "tee"))]
+    control_socket_path: Option<PathBuf>,
 }
 
 impl ContextConfig {
@@ -2628,6 +2630,35 @@ pub unsafe extern "C" fn krun_get_balloon_stats(
     }
 }
 
+/// Set the path for a Unix control socket for runtime VM management.
+/// Must be called before krun_start_enter(). The socket accepts JSON
+/// commands for balloon control and other runtime operations.
+#[allow(clippy::missing_safety_doc)]
+#[cfg(not(feature = "tee"))]
+#[no_mangle]
+pub unsafe extern "C" fn krun_set_control_socket(
+    ctx_id: u32,
+    c_socket_path: *const c_char,
+) -> i32 {
+    if c_socket_path.is_null() {
+        return -libc::EINVAL;
+    }
+
+    let socket_path = match CStr::from_ptr(c_socket_path).to_str() {
+        Ok(p) => p,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            ctx_cfg.get_mut().control_socket_path = Some(PathBuf::from(socket_path));
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
 #[no_mangle]
 #[allow(unreachable_code)]
 pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
@@ -2815,11 +2846,31 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     };
 
     #[cfg(not(feature = "tee"))]
-    if let Some(ref balloon) = _vmm.lock().unwrap().balloon {
+    let _balloon_ref = _vmm.lock().unwrap().balloon.clone();
+
+    #[cfg(not(feature = "tee"))]
+    if let Some(ref balloon) = _balloon_ref {
         BALLOON_MAP
             .lock()
             .unwrap()
             .insert(ctx_id, balloon.clone());
+    }
+
+    #[cfg(not(feature = "tee"))]
+    if let Some(ref socket_path) = ctx_cfg.control_socket_path {
+        match vmm::control_socket::ControlSocket::new(socket_path, _balloon_ref.clone()) {
+            Ok(cs) => {
+                let cs = std::sync::Arc::new(std::sync::Mutex::new(cs));
+                if let Err(e) = event_manager.add_subscriber(cs) {
+                    error!("Failed to register control socket: {e:?}");
+                    return -libc::EINVAL;
+                }
+            }
+            Err(e) => {
+                error!("Failed to create control socket at {}: {e}", socket_path.display());
+                return -libc::EINVAL;
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]

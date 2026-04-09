@@ -1284,6 +1284,27 @@ int32_t krun_set_balloon_target(uint32_t ctx_id, uint32_t num_pages);
 int32_t krun_get_balloon_stats(uint32_t ctx_id, uint32_t *actual,
                                 uint32_t *target, uint32_t *free);
 
+/**
+ * Set the path for a Unix control socket for runtime VM management.
+ * Must be called before krun_start_enter(). The socket accepts newline-
+ * delimited JSON commands for balloon control and other runtime operations.
+ *
+ * Supported commands:
+ *   {"cmd": "balloon_set", "target_mib": <uint>}
+ *   {"cmd": "balloon_stats"}
+ *
+ * The socket is chmod 0700, accepts one client at a time, and is
+ * automatically removed on clean shutdown.
+ *
+ * Arguments:
+ *  "ctx_id"      - the VM context ID.
+ *  "socket_path" - filesystem path for the Unix domain socket.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_control_socket(uint32_t ctx_id, const char *socket_path);
+
 #ifdef __cplusplus
 }
 #endif
