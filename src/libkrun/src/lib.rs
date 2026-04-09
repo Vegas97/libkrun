@@ -2858,17 +2858,27 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     #[cfg(not(feature = "tee"))]
     if let Some(ref socket_path) = ctx_cfg.control_socket_path {
+        let balloon_configured = _balloon_ref.is_some();
         match vmm::control_socket::ControlSocket::new(socket_path, _balloon_ref.clone()) {
             Ok(cs) => {
                 let cs = std::sync::Arc::new(std::sync::Mutex::new(cs));
                 if let Err(e) = event_manager.add_subscriber(cs) {
-                    error!("Failed to register control socket: {e:?}");
-                    return -libc::EINVAL;
+                    if balloon_configured {
+                        error!("Failed to register control socket: {e:?}");
+                        return -libc::EINVAL;
+                    }
+                    error!("Failed to register control socket: {e:?}, continuing without it");
                 }
             }
             Err(e) => {
-                error!("Failed to create control socket at {}: {e}", socket_path.display());
-                return -libc::EINVAL;
+                if balloon_configured {
+                    error!("Failed to create control socket at {}: {e}", socket_path.display());
+                    return -libc::EINVAL;
+                }
+                error!(
+                    "Failed to create control socket at {}: {e}, continuing without it",
+                    socket_path.display()
+                );
             }
         }
     }
