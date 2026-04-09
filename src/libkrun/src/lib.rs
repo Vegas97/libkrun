@@ -164,6 +164,8 @@ struct ContextConfig {
     console_output: Option<PathBuf>,
     vmm_uid: Option<libc::uid_t>,
     vmm_gid: Option<libc::gid_t>,
+    #[cfg(not(feature = "tee"))]
+    initial_balloon_target: Option<u32>,
 }
 
 impl ContextConfig {
@@ -429,6 +431,10 @@ fn with_cfg(ctx_id: u32, f: impl FnOnce(&mut ContextConfig) -> i32) -> i32 {
 
 static CTX_MAP: Lazy<Mutex<HashMap<u32, ContextConfig>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static CTX_IDS: AtomicI32 = AtomicI32::new(0);
+
+#[cfg(not(feature = "tee"))]
+static BALLOON_MAP: Lazy<Mutex<HashMap<u32, std::sync::Arc<Mutex<devices::virtio::Balloon>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn log_level_to_filter_str(level: u32) -> &'static str {
     match level {
@@ -2523,6 +2529,66 @@ pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const
     KRUN_SUCCESS
 }
 
+/// Set initial balloon configuration before VM start.
+/// If not called, balloon is inactive (target = 0, no inflation).
+#[cfg(not(feature = "tee"))]
+#[no_mangle]
+pub extern "C" fn krun_set_balloon_config(ctx_id: u32, initial_target: u32) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            cfg.initial_balloon_target = Some(initial_target);
+            cfg.vmr.balloon_initial_target = Some(initial_target);
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+/// Set the balloon target size in number of 4KB pages at runtime.
+/// The guest will inflate or deflate to reach this target.
+#[cfg(not(feature = "tee"))]
+#[no_mangle]
+pub extern "C" fn krun_set_balloon_target(ctx_id: u32, num_pages: u32) -> i32 {
+    let balloon_map = BALLOON_MAP.lock().unwrap();
+    match balloon_map.get(&ctx_id) {
+        Some(balloon) => {
+            balloon.lock().unwrap().set_num_pages(num_pages);
+            KRUN_SUCCESS
+        }
+        None => -libc::ENOENT,
+    }
+}
+
+/// Get current balloon statistics from the guest.
+#[allow(clippy::missing_safety_doc)]
+#[cfg(not(feature = "tee"))]
+#[no_mangle]
+pub unsafe extern "C" fn krun_get_balloon_stats(
+    ctx_id: u32,
+    actual: *mut u32,
+    target: *mut u32,
+    free: *mut u32,
+) -> i32 {
+    if actual.is_null() || target.is_null() || free.is_null() {
+        return -libc::EINVAL;
+    }
+
+    let balloon_map = BALLOON_MAP.lock().unwrap();
+    match balloon_map.get(&ctx_id) {
+        Some(balloon) => {
+            let b = balloon.lock().unwrap();
+            *actual = b.actual();
+            *target = b.num_pages();
+            // Free memory stats from the stats virtqueue are not yet implemented.
+            *free = 0;
+            KRUN_SUCCESS
+        }
+        None => -libc::ENOENT,
+    }
+}
+
 #[no_mangle]
 #[allow(unreachable_code)]
 pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
@@ -2708,6 +2774,14 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             return -libc::EINVAL;
         }
     };
+
+    #[cfg(not(feature = "tee"))]
+    if let Some(ref balloon) = _vmm.lock().unwrap().balloon {
+        BALLOON_MAP
+            .lock()
+            .unwrap()
+            .insert(ctx_id, balloon.clone());
+    }
 
     #[cfg(target_os = "macos")]
     if ctx_cfg.gpu_virgl_flags.is_some() {

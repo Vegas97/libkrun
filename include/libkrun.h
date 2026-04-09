@@ -1226,6 +1226,48 @@ int32_t krun_set_root_disk_remount(uint32_t ctx_id, const char *device, const ch
  */
 int32_t krun_start_enter(uint32_t ctx_id);
 
+/**
+ * Set initial balloon configuration before VM start.
+ * If not called, balloon is inactive (target = 0, no inflation).
+ *
+ * Arguments:
+ *  "ctx_id"         - the VM context ID.
+ *  "initial_target" - initial balloon target in number of 4KB pages to inflate at boot.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_balloon_config(uint32_t ctx_id, uint32_t initial_target);
+
+/**
+ * Set the balloon target size in number of 4KB pages at runtime.
+ * The guest will inflate (give back memory) or deflate (reclaim memory)
+ * to reach this target. Can only be called after krun_start_enter().
+ *
+ * Arguments:
+ *  "ctx_id"    - the VM context ID.
+ *  "num_pages" - target number of 4KB pages to balloon (0 = no balloon).
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_balloon_target(uint32_t ctx_id, uint32_t num_pages);
+
+/**
+ * Get current balloon statistics from the guest.
+ *
+ * Arguments:
+ *  "ctx_id" - the VM context ID.
+ *  "actual" - OUT: actual number of pages currently ballooned.
+ *  "target" - OUT: target number of pages (last set).
+ *  "free"   - OUT: free memory in guest (pages), or 0 if unavailable.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_get_balloon_stats(uint32_t ctx_id, uint32_t *actual,
+                                uint32_t *target, uint32_t *free);
+
 #ifdef __cplusplus
 }
 #endif

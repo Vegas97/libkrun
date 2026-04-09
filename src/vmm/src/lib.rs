@@ -207,6 +207,10 @@ pub struct Vmm {
     mmio_device_manager: MMIODeviceManager,
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
+
+    /// Reference to the balloon device for runtime control.
+    #[cfg(not(feature = "tee"))]
+    pub balloon: Option<Arc<Mutex<devices::virtio::Balloon>>>,
 }
 
 impl Vmm {

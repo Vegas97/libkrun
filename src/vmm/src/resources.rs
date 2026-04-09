@@ -189,6 +189,9 @@ pub struct VmResources {
     pub serial_consoles: Vec<SerialConsoleConfig>,
     /// Virtio consoles to attach to the guest
     pub virtio_consoles: Vec<VirtioConsoleConfigMode>,
+    /// Initial balloon target in pages (if set, balloon inflates at boot).
+    #[cfg(not(feature = "tee"))]
+    pub balloon_initial_target: Option<u32>,
 }
 
 impl VmResources {

@@ -71,6 +71,23 @@ impl Balloon {
         defs::BALLOON_DEV_ID
     }
 
+    /// Set the balloon target size (number of 4KB pages the host wants the guest to give up).
+    /// Signals a config change interrupt if the device is activated.
+    pub fn set_num_pages(&mut self, num_pages: u32) {
+        self.config.num_pages = num_pages;
+        self.device_state.signal_config_change();
+    }
+
+    /// Get the current balloon target (num_pages).
+    pub fn num_pages(&self) -> u32 {
+        self.config.num_pages
+    }
+
+    /// Get the actual number of pages currently in the balloon (as reported by the guest).
+    pub fn actual(&self) -> u32 {
+        self.config.actual
+    }
+
     pub fn process_frq(&mut self) -> bool {
         debug!("balloon: process_frq()");
         let mem = match self.device_state {
@@ -152,11 +169,28 @@ impl VirtioDevice for Balloon {
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
-        warn!(
-            "balloon: guest driver attempted to write device config (offset={:x}, len={:x})",
-            offset,
-            data.len()
-        );
+        // The guest driver writes the `actual` field at offset 4 to report
+        // how many pages are currently in the balloon.
+        let config_slice = self.config.as_mut_slice();
+        let config_len = config_slice.len() as u64;
+        if offset >= config_len {
+            error!("Failed to write config space");
+            return;
+        }
+        // Only allow writes to the `actual` field (offset 4, 4 bytes).
+        let actual_offset = 4u64;
+        let actual_end = 8u64;
+        if offset >= actual_offset && offset + data.len() as u64 <= actual_end {
+            let start = offset as usize;
+            let end = start + data.len();
+            config_slice[start..end].copy_from_slice(data);
+        } else {
+            warn!(
+                "balloon: guest driver attempted to write non-actual config (offset={:x}, len={:x})",
+                offset,
+                data.len()
+            );
+        }
     }
 
     fn activate(
@@ -187,5 +221,74 @@ impl VirtioDevice for Balloon {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_balloon_new() {
+        let balloon = Balloon::new().unwrap();
+        assert_eq!(balloon.num_pages(), 0);
+        assert_eq!(balloon.actual(), 0);
+        assert!(!balloon.is_activated());
+        assert_eq!(balloon.id(), defs::BALLOON_DEV_ID);
+    }
+
+    #[test]
+    fn test_set_num_pages() {
+        let mut balloon = Balloon::new().unwrap();
+        // Before activation, set_num_pages should not panic (signal_config_change is a no-op).
+        balloon.set_num_pages(1024);
+        assert_eq!(balloon.num_pages(), 1024);
+
+        balloon.set_num_pages(0);
+        assert_eq!(balloon.num_pages(), 0);
+    }
+
+    #[test]
+    fn test_read_config() {
+        let mut balloon = Balloon::new().unwrap();
+        balloon.set_num_pages(42);
+
+        // Read num_pages from config offset 0.
+        let mut buf = [0u8; 4];
+        balloon.read_config(0, &mut buf);
+        assert_eq!(u32::from_le_bytes(buf), 42);
+
+        // Read actual from config offset 4 (should be 0).
+        balloon.read_config(4, &mut buf);
+        assert_eq!(u32::from_le_bytes(buf), 0);
+    }
+
+    #[test]
+    fn test_write_config_actual() {
+        let mut balloon = Balloon::new().unwrap();
+
+        // Guest writes `actual` at offset 4.
+        let actual_val: u32 = 100;
+        balloon.write_config(4, &actual_val.to_le_bytes());
+        assert_eq!(balloon.actual(), 100);
+
+        // Write to offset 0 (num_pages) should be rejected.
+        let before = balloon.num_pages();
+        balloon.write_config(0, &999u32.to_le_bytes());
+        assert_eq!(balloon.num_pages(), before);
+    }
+
+    #[test]
+    fn test_read_config_out_of_bounds() {
+        let balloon = Balloon::new().unwrap();
+        let mut buf = [0u8; 4];
+        // Reading past config should not panic.
+        balloon.read_config(100, &mut buf);
+    }
+
+    #[test]
+    fn test_device_type() {
+        let balloon = Balloon::new().unwrap();
+        assert_eq!(balloon.device_type(), uapi::VIRTIO_ID_BALLOON);
     }
 }
