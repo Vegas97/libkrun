@@ -1386,6 +1386,15 @@ impl<F: FileSystem + Sync> Server<F> {
             moffset,
         } = r.read_obj().map_err(Error::DecodeMessage)?;
 
+        // Reject writable DAX mappings on read-only filesystems.
+        if self.read_only && (flags & SetupmappingFlags::WRITE.bits()) != 0 {
+            return reply_error(
+                linux_error(io::Error::from_raw_os_error(libc::EROFS)),
+                in_header.unique,
+                w,
+            );
+        }
+
         match self.fs.setupmapping(
             Context::from(in_header),
             in_header.nodeid.into(),

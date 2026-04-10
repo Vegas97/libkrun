@@ -41,8 +41,20 @@ impl ControlSocket {
         socket_path: &Path,
         balloon: Option<Arc<Mutex<Balloon>>>,
     ) -> std::io::Result<Self> {
-        // Remove stale socket if it exists.
+        // Remove stale socket if it exists. Only remove actual socket files —
+        // refuse to delete regular files or symlinks to prevent misconfiguration damage.
         if socket_path.exists() {
+            use std::os::unix::fs::FileTypeExt;
+            let metadata = std::fs::symlink_metadata(socket_path)?;
+            if !metadata.file_type().is_socket() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "control socket path {} exists and is not a socket",
+                        socket_path.display()
+                    ),
+                ));
+            }
             warn!(
                 "control_socket: removing stale socket at {}",
                 socket_path.display()
@@ -219,8 +231,13 @@ impl ControlSocket {
             }
         };
 
-        // Convert MiB to 4KB pages.
-        let pages = target_mib * 256;
+        // Convert MiB to 4KB pages (checked to prevent overflow).
+        let pages = match target_mib.checked_mul(256) {
+            Some(p) => p,
+            None => {
+                return r#"{"ok":false,"error":"target_mib too large"}"#.to_string()
+            }
+        };
         balloon.lock().unwrap().set_num_pages(pages);
 
         r#"{"ok":true}"#.to_string()
@@ -418,6 +435,34 @@ mod tests {
         let cs = ControlSocket::new(&socket_path, None).unwrap();
         let resp = cs.dispatch_command(r#"{"target_mib": 64}"#);
         assert!(resp.contains("missing or invalid"));
+        drop(cs);
+    }
+
+    #[test]
+    fn test_new_rejects_non_socket_path() {
+        let path = std::env::temp_dir().join("test_ctrl_not_a_socket.txt");
+        // Create a regular file at the path.
+        std::fs::write(&path, "not a socket").unwrap();
+        let result = ControlSocket::new(&path, None);
+        assert!(result.is_err());
+        // The regular file should NOT have been deleted.
+        assert!(path.exists());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_balloon_set_overflow() {
+        let socket_path = std::env::temp_dir().join("test_ctrl_overflow.sock");
+        let _ = std::fs::remove_file(&socket_path);
+        let balloon = Arc::new(Mutex::new(Balloon::new().unwrap()));
+        let cs = ControlSocket::new(&socket_path, Some(balloon.clone())).unwrap();
+
+        // u32::MAX * 256 would overflow. Should return error, not wrap.
+        let resp =
+            cs.dispatch_command(r#"{"cmd": "balloon_set", "target_mib": 4294967295}"#);
+        assert!(resp.contains("target_mib too large"));
+        // Balloon target should be unchanged (0).
+        assert_eq!(balloon.lock().unwrap().num_pages(), 0);
         drop(cs);
     }
 }

@@ -193,6 +193,18 @@ impl Balloon {
         while let Some(head) = queues[FRQ_INDEX].queue.pop(mem) {
             let index = head.index;
             for desc in head.into_iter() {
+                let len = desc.len as usize;
+                if len == 0 {
+                    continue;
+                }
+                // Validate the entire range is within a single contiguous guest memory region.
+                if mem.get_slice(desc.addr, len).is_err() {
+                    error!(
+                        "balloon: FRQ range {:?}+{} exceeds guest memory or spans regions",
+                        desc.addr, len
+                    );
+                    continue;
+                }
                 let host_addr = match mem.get_host_address(desc.addr) {
                     Ok(addr) => addr,
                     Err(e) => {
@@ -205,13 +217,13 @@ impl Balloon {
                 };
                 debug!(
                     "balloon: FRQ release guest_addr={:?} host_addr={:p} len={}",
-                    desc.addr, host_addr, desc.len
+                    desc.addr, host_addr, len
                 );
-                if !unsafe { release_host_pages_advisory(host_addr, desc.len as usize) } {
+                if !unsafe { release_host_pages_advisory(host_addr, len) } {
                     error!(
                         "balloon: FRQ madvise failed for guest_addr={:?} len={}: {}",
                         desc.addr,
-                        desc.len,
+                        len,
                         std::io::Error::last_os_error()
                     );
                 }
@@ -265,8 +277,10 @@ impl Balloon {
             };
 
             // Read all PFNs from the descriptor chain.
+            // Cap preallocation to prevent OOM from guest-controlled descriptor lengths.
+            const MAX_PFNS_PER_CHAIN: usize = 256 * 1024; // 1GB worth of 4KB pages
             let num_pfns = reader.available_bytes() / std::mem::size_of::<Le32>();
-            let mut pfns = Vec::with_capacity(num_pfns);
+            let mut pfns = Vec::with_capacity(num_pfns.min(MAX_PFNS_PER_CHAIN));
             while reader.available_bytes() >= std::mem::size_of::<Le32>() {
                 match reader.read_obj::<Le32>() {
                     Ok(pfn) => pfns.push(u32::from(pfn)),
@@ -731,9 +745,32 @@ mod tests {
         let mut balloon = activate_balloon(&mem);
 
         // FRQ descriptor points to a valid guest memory region.
-        // desc.addr = data buffer address, desc.len = region size.
         setup_queue_descriptor(&mem, &mut balloon, FRQ_INDEX, DATA_BUF, 4096);
 
+        assert!(balloon.process_frq());
+    }
+
+    #[test]
+    fn test_process_frq_zero_length_desc() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x100000)]).unwrap();
+        let mut balloon = activate_balloon(&mem);
+
+        // Zero-length FRQ descriptor — should be skipped, no crash.
+        setup_queue_descriptor(&mem, &mut balloon, FRQ_INDEX, DATA_BUF, 0);
+
+        assert!(balloon.process_frq());
+    }
+
+    #[test]
+    fn test_process_frq_oversized_len() {
+        // Guest memory is only 0x100000 bytes. FRQ descriptor starts at 0x80000
+        // with len=0x100000 (extends way past guest memory). Should be rejected.
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x100000)]).unwrap();
+        let mut balloon = activate_balloon(&mem);
+
+        setup_queue_descriptor(&mem, &mut balloon, FRQ_INDEX, DATA_BUF, 0x100000);
+
+        // Should not panic — oversized range is logged and skipped.
         assert!(balloon.process_frq());
     }
 

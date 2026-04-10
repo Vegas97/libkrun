@@ -1060,7 +1060,8 @@ pub fn build_microvm(
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     if vm_resources
         .fs
-        .first()
+        .iter()
+        .find(|fs| fs.fs_id == "/dev/root")
         .is_some_and(|root_fs| root_fs.read_only)
     {
         let cmdline = vmm
