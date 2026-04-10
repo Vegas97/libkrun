@@ -71,9 +71,19 @@ impl ControlSocket {
         listener.set_nonblocking(true)?;
 
         // chmod 0700 on the socket file.
-        unsafe {
-            let c_path = std::ffi::CString::new(socket_path.to_str().unwrap()).unwrap();
-            libc::chmod(c_path.as_ptr(), 0o700);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            if let Ok(c_path) = std::ffi::CString::new(socket_path.as_os_str().as_bytes()) {
+                let ret = unsafe { libc::chmod(c_path.as_ptr(), 0o700) };
+                if ret != 0 {
+                    warn!(
+                        "control_socket: chmod failed on {}: {}",
+                        socket_path.display(),
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
         }
 
         Ok(ControlSocket {
