@@ -151,51 +151,63 @@ impl ControlSocket {
     }
 
     /// Handle data from the connected client.
+    ///
+    /// Loops `read_line()` until `WouldBlock` or EOF to drain any lines
+    /// buffered inside `BufReader` that epoll cannot see. On hangup events,
+    /// drains remaining data before disconnecting.
     fn handle_client_data(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
         let event_set = event.event_set();
 
-        // Client disconnected or errored.
-        if event_set.contains(EventSet::HANG_UP) || event_set.contains(EventSet::READ_HANG_UP) {
+        // Track hangup — drain buffered data before disconnecting.
+        let hanging_up =
+            event_set.contains(EventSet::HANG_UP) || event_set.contains(EventSet::READ_HANG_UP);
+
+        // Drain all complete lines from the BufReader. We collect into a vec
+        // to release the mutable borrow on self.client before dispatching.
+        let mut lines = Vec::new();
+        let mut should_disconnect = false;
+
+        if let Some(client) = self.client.as_mut() {
+            loop {
+                let mut line = String::new();
+                match client.reader.read_line(&mut line) {
+                    Ok(0) => {
+                        should_disconnect = true;
+                        break;
+                    }
+                    Ok(_) => lines.push(line),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        error!("control_socket: read error: {e}");
+                        should_disconnect = true;
+                        break;
+                    }
+                }
+            }
+        } else {
+            return;
+        }
+
+        // Process collected lines.
+        for line in &lines {
+            let now = Instant::now();
+            if now.duration_since(self.rate_window_start).as_secs() >= 1 {
+                self.rate_window_start = now;
+                self.rate_count = 0;
+            }
+            self.rate_count += 1;
+            if self.rate_count > RATE_LIMIT_MAX {
+                self.send_response(r#"{"ok":false,"error":"rate limit exceeded"}"#);
+                return;
+            }
+
+            let response = self.dispatch_command(line.trim());
+            self.send_response(&response);
+        }
+
+        if should_disconnect || (hanging_up && lines.is_empty()) {
             self.disconnect_client(event_manager);
-            return;
         }
-
-        let client = match self.client.as_mut() {
-            Some(c) => c,
-            None => return,
-        };
-
-        let mut line = String::new();
-        match client.reader.read_line(&mut line) {
-            Ok(0) => {
-                // EOF — client disconnected.
-                self.disconnect_client(event_manager);
-                return;
-            }
-            Ok(_) => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
-            Err(e) => {
-                error!("control_socket: read error: {e}");
-                self.disconnect_client(event_manager);
-                return;
-            }
-        }
-
-        // Rate limiting.
-        let now = Instant::now();
-        if now.duration_since(self.rate_window_start).as_secs() >= 1 {
-            self.rate_window_start = now;
-            self.rate_count = 0;
-        }
-        self.rate_count += 1;
-        if self.rate_count > RATE_LIMIT_MAX {
-            let resp = r#"{"ok":false,"error":"rate limit exceeded"}"#;
-            self.send_response(resp);
-            return;
-        }
-
-        let response = self.dispatch_command(line.trim());
-        self.send_response(&response);
     }
 
     fn send_response(&mut self, response: &str) {
@@ -223,7 +235,7 @@ impl ControlSocket {
         match cmd.as_str() {
             "balloon_set" => self.cmd_balloon_set(line),
             "balloon_stats" => self.cmd_balloon_stats(),
-            _ => format!(r#"{{"ok":false,"error":"unknown command: {cmd}"}}"#),
+            _ => r#"{"ok":false,"error":"unknown command"}"#.to_string(),
         }
     }
 
@@ -345,6 +357,12 @@ fn extract_u32_field(json: &str, key: &str) -> Option<u32> {
     if end == 0 {
         return None;
     }
+    // Reject floats (123.5) and exponent notation (1e2, 1E10).
+    if let Some(next) = trimmed[end..].chars().next() {
+        if next == '.' || next == 'e' || next == 'E' {
+            return None;
+        }
+    }
     trimmed[..end].parse().ok()
 }
 
@@ -375,6 +393,36 @@ mod tests {
     fn test_extract_u32_zero() {
         let json = r#"{"target_mib": 0}"#;
         assert_eq!(extract_u32_field(json, "target_mib"), Some(0));
+    }
+
+    #[test]
+    fn test_extract_u32_rejects_float() {
+        let json = r#"{"target_mib": 123.5}"#;
+        assert_eq!(extract_u32_field(json, "target_mib"), None);
+    }
+
+    #[test]
+    fn test_extract_u32_rejects_exponent() {
+        assert_eq!(
+            extract_u32_field(r#"{"target_mib": 1e2}"#, "target_mib"),
+            None
+        );
+        assert_eq!(
+            extract_u32_field(r#"{"target_mib": 1E10}"#, "target_mib"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_dispatch_unknown_command_no_echo() {
+        let socket_path = std::env::temp_dir().join("test_ctrl_no_echo.sock");
+        let _ = std::fs::remove_file(&socket_path);
+        let cs = ControlSocket::new(&socket_path, None).unwrap();
+        let resp = cs.dispatch_command(r#"{"cmd": "evil\"inject"}"#);
+        assert!(resp.contains("unknown command"));
+        // Must NOT echo the command back (prevents JSON injection).
+        assert!(!resp.contains("evil"));
+        drop(cs);
     }
 
     #[test]
