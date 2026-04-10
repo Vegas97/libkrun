@@ -963,6 +963,8 @@ pub fn build_microvm(
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
+        #[cfg(not(feature = "tee"))]
+        balloon: None,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
@@ -971,7 +973,16 @@ pub fn build_microvm(
     }
 
     #[cfg(not(feature = "tee"))]
-    attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
+    let balloon_device = attach_balloon_device(
+        &mut vmm,
+        event_manager,
+        intc.clone(),
+        vm_resources.balloon_initial_target,
+    )?;
+    #[cfg(not(feature = "tee"))]
+    {
+        vmm.balloon = Some(balloon_device);
+    }
     #[cfg(not(feature = "tee"))]
     attach_rng_device(&mut vmm, event_manager, intc.clone())?;
     let mut console_id = 0;
@@ -1043,6 +1054,27 @@ pub fn build_microvm(
         #[cfg(target_os = "macos")]
         _sender,
     )?;
+
+    // If the root filesystem is read-only, replace "rw" with "ro" in the kernel cmdline
+    // so the guest kernel mounts it read-only from boot.
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    if vm_resources
+        .fs
+        .iter()
+        .find(|fs| fs.fs_id == "/dev/root")
+        .is_some_and(|root_fs| root_fs.read_only)
+    {
+        let cmdline = vmm
+            .kernel_cmdline
+            .as_str()
+            .split_whitespace()
+            .map(|tok| if tok == "rw" { "ro" } else { tok })
+            .collect::<Vec<_>>()
+            .join(" ");
+        vmm.kernel_cmdline = kernel::cmdline::Cmdline::new(arch::CMDLINE_MAX_SIZE);
+        vmm.kernel_cmdline.insert_str(&cmdline).unwrap();
+    }
+
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
 
@@ -1892,6 +1924,7 @@ fn attach_fs_devices(
                 config.shared_dir.clone(),
                 exit_code.clone(),
                 config.allow_root_dir_delete,
+                config.read_only,
             )
             .unwrap(),
         ));
@@ -2191,10 +2224,15 @@ fn attach_balloon_device(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,
     intc: IrqChip,
-) -> std::result::Result<(), StartMicrovmError> {
+    initial_target: Option<u32>,
+) -> std::result::Result<Arc<Mutex<devices::virtio::Balloon>>, StartMicrovmError> {
     use self::StartMicrovmError::*;
 
     let balloon = Arc::new(Mutex::new(devices::virtio::Balloon::new().unwrap()));
+
+    if let Some(target) = initial_target {
+        balloon.lock().unwrap().set_num_pages(target);
+    }
 
     event_manager
         .add_subscriber(balloon.clone())
@@ -2202,10 +2240,12 @@ fn attach_balloon_device(
 
     let id = String::from(balloon.lock().unwrap().id());
 
+    let balloon_ref = balloon.clone();
+
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc.clone(), balloon).map_err(RegisterBalloonDevice)?;
 
-    Ok(())
+    Ok(balloon_ref)
 }
 
 #[cfg(feature = "blk")]
@@ -2333,7 +2373,8 @@ fn attach_snd_device(vmm: &mut Vmm, intc: IrqChip) -> std::result::Result<(), St
     Ok(())
 }
 
-#[cfg(test)]
+// Builder tests reference KVM-specific APIs not available on macOS/HVF.
+#[cfg(all(test, target_os = "linux"))]
 pub mod tests {
     use super::*;
     use crate::vmm_config::kernel_bundle::KernelBundle;

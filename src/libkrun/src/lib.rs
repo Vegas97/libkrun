@@ -164,6 +164,10 @@ struct ContextConfig {
     console_output: Option<PathBuf>,
     vmm_uid: Option<libc::uid_t>,
     vmm_gid: Option<libc::gid_t>,
+    #[cfg(not(feature = "tee"))]
+    initial_balloon_target: Option<u32>,
+    #[cfg(not(feature = "tee"))]
+    control_socket_path: Option<PathBuf>,
 }
 
 impl ContextConfig {
@@ -430,6 +434,10 @@ fn with_cfg(ctx_id: u32, f: impl FnOnce(&mut ContextConfig) -> i32) -> i32 {
 static CTX_MAP: Lazy<Mutex<HashMap<u32, ContextConfig>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static CTX_IDS: AtomicI32 = AtomicI32::new(0);
 
+#[cfg(not(feature = "tee"))]
+static BALLOON_MAP: Lazy<Mutex<HashMap<u32, std::sync::Arc<Mutex<devices::virtio::Balloon>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 fn log_level_to_filter_str(level: u32) -> &'static str {
     match level {
         0 => "off",
@@ -595,6 +603,42 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
                 // Default to a conservative 512 MB window.
                 shm_size: Some(1 << 29),
                 allow_root_dir_delete: false,
+                read_only: false,
+            });
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+/// Sets a read-only root filesystem for the microVM. The FUSE server will reject
+/// all mutating operations (write, create, mkdir, etc.) with EROFS, and the guest
+/// kernel will mount the rootfs as read-only from boot.
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(not(feature = "tee"))]
+pub unsafe extern "C" fn krun_set_root_ro(ctx_id: u32, c_root_path: *const c_char) -> i32 {
+    if c_root_path.is_null() {
+        return -libc::EINVAL;
+    }
+    let root_path = match CStr::from_ptr(c_root_path).to_str() {
+        Ok(root) => root,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    let fs_id = "/dev/root".to_string();
+    let shared_dir = root_path.to_string();
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            cfg.vmr.add_fs_device(FsDeviceConfig {
+                fs_id,
+                shared_dir,
+                shm_size: Some(1 << 29),
+                allow_root_dir_delete: false,
+                read_only: true,
             });
         }
         Entry::Vacant(_) => return -libc::ENOENT,
@@ -628,6 +672,7 @@ pub unsafe extern "C" fn krun_add_virtiofs(
                 shared_dir: path.to_string(),
                 shm_size: None,
                 allow_root_dir_delete: false,
+                read_only: false,
             });
         }
         Entry::Vacant(_) => return -libc::ENOENT,
@@ -662,6 +707,7 @@ pub unsafe extern "C" fn krun_add_virtiofs2(
                 shared_dir: path.to_string(),
                 shm_size: Some(shm_size.try_into().unwrap()),
                 allow_root_dir_delete: false,
+                read_only: false,
             });
         }
         Entry::Vacant(_) => return -libc::ENOENT,
@@ -2294,6 +2340,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                 // Default to a conservative 512 MB window.
                 shm_size: Some(1 << 29),
                 allow_root_dir_delete: true,
+                read_only: false,
             });
 
             ctx_cfg.set_block_root(device, fstype, options);
@@ -2523,6 +2570,95 @@ pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const
     KRUN_SUCCESS
 }
 
+/// Set initial balloon configuration before VM start.
+/// If not called, balloon is inactive (target = 0, no inflation).
+#[cfg(not(feature = "tee"))]
+#[no_mangle]
+pub extern "C" fn krun_set_balloon_config(ctx_id: u32, initial_target: u32) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            cfg.initial_balloon_target = Some(initial_target);
+            cfg.vmr.balloon_initial_target = Some(initial_target);
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+/// Set the balloon target size in number of 4KB pages at runtime.
+/// The guest will inflate or deflate to reach this target.
+#[cfg(not(feature = "tee"))]
+#[no_mangle]
+pub extern "C" fn krun_set_balloon_target(ctx_id: u32, num_pages: u32) -> i32 {
+    let balloon_map = BALLOON_MAP.lock().unwrap();
+    match balloon_map.get(&ctx_id) {
+        Some(balloon) => {
+            balloon.lock().unwrap().set_num_pages(num_pages);
+            KRUN_SUCCESS
+        }
+        None => -libc::ENOENT,
+    }
+}
+
+/// Get current balloon statistics from the guest.
+#[allow(clippy::missing_safety_doc)]
+#[cfg(not(feature = "tee"))]
+#[no_mangle]
+pub unsafe extern "C" fn krun_get_balloon_stats(
+    ctx_id: u32,
+    actual: *mut u32,
+    target: *mut u32,
+    free: *mut u32,
+) -> i32 {
+    if actual.is_null() || target.is_null() || free.is_null() {
+        return -libc::EINVAL;
+    }
+
+    let balloon_map = BALLOON_MAP.lock().unwrap();
+    match balloon_map.get(&ctx_id) {
+        Some(balloon) => {
+            let b = balloon.lock().unwrap();
+            *actual = b.actual();
+            *target = b.num_pages();
+            // Free memory stats from the stats virtqueue are not yet implemented.
+            *free = 0;
+            KRUN_SUCCESS
+        }
+        None => -libc::ENOENT,
+    }
+}
+
+/// Set the path for a Unix control socket for runtime VM management.
+/// Must be called before krun_start_enter(). The socket accepts JSON
+/// commands for balloon control and other runtime operations.
+#[allow(clippy::missing_safety_doc)]
+#[cfg(not(feature = "tee"))]
+#[no_mangle]
+pub unsafe extern "C" fn krun_set_control_socket(
+    ctx_id: u32,
+    c_socket_path: *const c_char,
+) -> i32 {
+    if c_socket_path.is_null() {
+        return -libc::EINVAL;
+    }
+
+    let socket_path = match CStr::from_ptr(c_socket_path).to_str() {
+        Ok(p) => p,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            ctx_cfg.get_mut().control_socket_path = Some(PathBuf::from(socket_path));
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
 #[no_mangle]
 #[allow(unreachable_code)]
 pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
@@ -2708,6 +2844,44 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             return -libc::EINVAL;
         }
     };
+
+    #[cfg(not(feature = "tee"))]
+    let _balloon_ref = _vmm.lock().unwrap().balloon.clone();
+
+    #[cfg(not(feature = "tee"))]
+    if let Some(ref balloon) = _balloon_ref {
+        BALLOON_MAP
+            .lock()
+            .unwrap()
+            .insert(ctx_id, balloon.clone());
+    }
+
+    #[cfg(not(feature = "tee"))]
+    if let Some(ref socket_path) = ctx_cfg.control_socket_path {
+        let balloon_configured = _balloon_ref.is_some();
+        match vmm::control_socket::ControlSocket::new(socket_path, _balloon_ref.clone()) {
+            Ok(cs) => {
+                let cs = std::sync::Arc::new(std::sync::Mutex::new(cs));
+                if let Err(e) = event_manager.add_subscriber(cs) {
+                    if balloon_configured {
+                        error!("Failed to register control socket: {e:?}");
+                        return -libc::EINVAL;
+                    }
+                    error!("Failed to register control socket: {e:?}, continuing without it");
+                }
+            }
+            Err(e) => {
+                if balloon_configured {
+                    error!("Failed to create control socket at {}: {e}", socket_path.display());
+                    return -libc::EINVAL;
+                }
+                error!(
+                    "Failed to create control socket at {}: {e}, continuing without it",
+                    socket_path.display()
+                );
+            }
+        }
+    }
 
     #[cfg(target_os = "macos")]
     if ctx_cfg.gpu_virgl_flags.is_some() {

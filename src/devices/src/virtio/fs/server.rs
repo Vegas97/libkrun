@@ -68,13 +68,15 @@ impl io::Write for ZCWriter<'_> {
 pub struct Server<F: FileSystem + Sync> {
     fs: F,
     options: AtomicU64,
+    read_only: bool,
 }
 
 impl<F: FileSystem + Sync> Server<F> {
-    pub fn new(fs: F) -> Server<F> {
+    pub fn new(fs: F, read_only: bool) -> Server<F> {
         Server {
             fs,
             options: AtomicU64::new(FsOptions::empty().bits()),
+            read_only,
         }
     }
 
@@ -97,6 +99,16 @@ impl<F: FileSystem + Sync> Server<F> {
             );
         }
         debug!("opcode: {}", in_header.opcode);
+
+        // Reject mutating operations on read-only filesystems at the VMM level.
+        if self.read_only && is_mutating_opcode(in_header.opcode) {
+            return reply_error(
+                linux_error(io::Error::from_raw_os_error(libc::EROFS)),
+                in_header.unique,
+                w,
+            );
+        }
+
         match in_header.opcode {
             x if x == Opcode::Lookup as u32 => self.lookup(in_header, r, w),
             x if x == Opcode::Forget as u32 => self.forget(in_header, r), // No reply.
@@ -515,6 +527,18 @@ impl<F: FileSystem + Sync> Server<F> {
         let OpenIn {
             flags, open_flags, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
+
+        // Reject opens with write access on read-only filesystems.
+        if self.read_only {
+            let access_mode = flags & libc::O_ACCMODE as u32;
+            if access_mode == libc::O_WRONLY as u32 || access_mode == libc::O_RDWR as u32 {
+                return reply_error(
+                    linux_error(io::Error::from_raw_os_error(libc::EROFS)),
+                    in_header.unique,
+                    w,
+                );
+            }
+        }
 
         let kill_priv = open_flags & OPEN_KILL_SUIDGID != 0;
 
@@ -1362,6 +1386,15 @@ impl<F: FileSystem + Sync> Server<F> {
             moffset,
         } = r.read_obj().map_err(Error::DecodeMessage)?;
 
+        // Reject writable DAX mappings on read-only filesystems.
+        if self.read_only && (flags & SetupmappingFlags::WRITE.bits()) != 0 {
+            return reply_error(
+                linux_error(io::Error::from_raw_os_error(libc::EROFS)),
+                in_header.unique,
+                w,
+            );
+        }
+
         match self.fs.setupmapping(
             Context::from(in_header),
             in_header.nodeid.into(),
@@ -1464,6 +1497,28 @@ fn reply_ok<T: ByteValued>(
 
     debug_assert_eq!(len, w.bytes_written());
     Ok(w.bytes_written())
+}
+
+/// Returns true for FUSE opcodes that modify filesystem state.
+fn is_mutating_opcode(opcode: u32) -> bool {
+    matches!(
+        opcode,
+        x if x == Opcode::Setattr as u32
+            || x == Opcode::Symlink as u32
+            || x == Opcode::Mknod as u32
+            || x == Opcode::Mkdir as u32
+            || x == Opcode::Unlink as u32
+            || x == Opcode::Rmdir as u32
+            || x == Opcode::Rename as u32
+            || x == Opcode::Link as u32
+            || x == Opcode::Write as u32
+            || x == Opcode::Setxattr as u32
+            || x == Opcode::Removexattr as u32
+            || x == Opcode::Create as u32
+            || x == Opcode::Fallocate as u32
+            || x == Opcode::Rename2 as u32
+            || x == Opcode::CopyFileRange as u32
+    )
 }
 
 fn reply_error(e: io::Error, unique: u64, mut w: Writer) -> Result<usize> {

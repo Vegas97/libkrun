@@ -17,7 +17,10 @@ mod defs {
         pub const VIRTIO_ID_BALLOON: u32 = 5;
         pub const VIRTIO_BALLOON_F_STATS_VQ: u32 = 1;
         pub const VIRTIO_BALLOON_F_FREE_PAGE_HINT: u32 = 3;
+        #[cfg(not(target_os = "macos"))]
         pub const VIRTIO_BALLOON_F_REPORTING: u32 = 5;
+        pub const VIRTIO_BALLOON_PFN_SHIFT: u32 = 12;
+        pub const VIRTIO_BALLOON_PAGE_SIZE: usize = 1 << VIRTIO_BALLOON_PFN_SHIFT;
     }
 }
 

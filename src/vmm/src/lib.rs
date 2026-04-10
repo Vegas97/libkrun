@@ -15,6 +15,9 @@ extern crate log;
 
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
+/// Control socket for runtime VM management.
+#[cfg(not(feature = "tee"))]
+pub mod control_socket;
 pub(crate) mod device_manager;
 /// Resource store for configured microVM resources.
 pub mod resources;
@@ -207,6 +210,10 @@ pub struct Vmm {
     mmio_device_manager: MMIODeviceManager,
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
+
+    /// Reference to the balloon device for runtime control.
+    #[cfg(not(feature = "tee"))]
+    pub balloon: Option<Arc<Mutex<devices::virtio::Balloon>>>,
 }
 
 impl Vmm {
