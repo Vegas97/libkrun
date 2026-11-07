@@ -96,7 +96,7 @@ collide on the client socket path, causing connection failures.
 
 ## virtiofs: Read-only rootfs API (`krun_set_root_ro`)
 
-**Commit:** (this branch, not yet committed)
+**Commits:** `e5133d9`, `450e1ac` (also preserved from the networking branch)
 
 **Problem:** virtiofs rejects `mount -o remount,ro /` from inside the VM.
 Without VMM-level enforcement, an attacker with code execution can modify
@@ -122,6 +122,40 @@ files on the rootfs. The Hive Shield threat model requires read-only rootfs.
 - `include/libkrun.h`
 
 **Upstream status:** Not applicable (Hive-specific feature)
+
+---
+
+## Balloon control and runtime management
+
+**Commits:** `4bad317`, `24c0beb`, `efe6741`, `2c9ae4a`, `c968e4b`, `b0a76db`
+
+The fork exposes balloon configuration, target updates, and statistics through
+the C API, and adds a Unix control socket for commands while a VM is running.
+The inflate and deflate queues process guest page lists with bounds checks;
+free-page reporting uses a separate advisory release path.
+
+| Interface | Target and statistics units |
+|---|---|
+| C API (`krun_set_balloon_config`, `krun_set_balloon_target`, `krun_get_balloon_stats`) | 4 KiB pages |
+| Control socket (`balloon_set`, `balloon_stats`) | MiB |
+
+Commands use newline-delimited JSON. The control socket preserves fragmented
+commands, drains commands before disconnecting, validates JSON with
+`serde_json`, and rejects non-integer or overflowing targets.
+
+**Upstream status:** Not yet submitted
+
+---
+
+## Recovered local fixes and merge verification
+
+- Guest init tolerates `EROFS` while checking existing root mount directories.
+- macOS virtiofs resolves a symlink root path before opening it with `O_NOFOLLOW`.
+- Unix datagram client paths include both the process ID and a per-NIC instance
+  ID, preventing NICs in one process from unlinking each other's sockets.
+- The networking and balloon branches are combined without dropping either
+  branch's changes. See [the build guide](docs/building-fork.md) for validation
+  commands and files to regenerate after cloning.
 
 ---
 
