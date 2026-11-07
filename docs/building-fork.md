@@ -8,12 +8,12 @@ root filesystem, and balloon-control changes. See [FORKS.md](../FORKS.md).
 ## macOS requirements
 
 Use an Apple Silicon Mac running macOS 14 or newer, with Xcode Command Line
-Tools and a Rust toolchain installed. The build also needs LLVM's linker,
-`xz`, and the guest firmware library:
+Tools and a Rust toolchain installed. The build also needs LLVM's linker and
+`libclang` for C bindings, `xz`, and the guest firmware library:
 
 ```sh
 # Run in a terminal on the new machine.
-brew install lld xz
+brew install llvm lld xz
 brew tap libkrun/krun
 brew trust --formula libkrun/krun/libkrunfw
 brew install libkrun/krun/libkrunfw
@@ -42,6 +42,10 @@ The Makefile downloads a Debian sysroot to `linux-sysroot/`, cross-compiles
 `init/init.c` for the Linux guest, and builds the macOS library. Initial builds
 need network access. `NET=1` and `BLK=1` enable virtio-net and virtio-block,
 which Hive uses.
+
+On macOS the Makefile enables runtime loading of `libclang` for binding
+generation, so a fresh build can discover the installed library without
+reusing cached binding-generator executables.
 
 | Generated output | How it is recreated |
 |---|---|

@@ -155,6 +155,8 @@ commands, drains commands before disconnecting, validates JSON with
   ID, preventing NICs in one process from unlinking each other's sockets.
 - macOS builds use the `aarch64` GNU target name so Clang finds the downloaded
   Debian GCC runtime when compiling the Linux guest init.
+- macOS builds enable runtime loading of `libclang` for the workspace's C
+  bindings and resolve the sysroot path before its directory is created.
 - The networking and balloon branches are combined without dropping either
   branch's changes. See [the build guide](docs/building-fork.md) for validation
   commands and files to regenerate after cloning.

@@ -87,6 +87,8 @@ all: $(LIBRARY_RELEASE_$(OS)) libkrun.pc
 debug: $(LIBRARY_DEBUG_$(OS)) libkrun.pc
 
 ifeq ($(OS),Darwin)
+    # Load libclang at runtime when generating the workspace's C bindings.
+    FEATURE_FLAGS += --features krun_input/bindgen_clang_runtime
 # If SYSROOT_LINUX is not set and we're on macOS, generate sysroot automatically
 ifeq ($(SYSROOT_LINUX),)
     SYSROOT_LINUX = $(ROOTFS_DIR)
@@ -96,7 +98,7 @@ else
 endif
     # Cross-compile on macOS with the LLVM linker (brew install lld)
     # Clang needs the GNU architecture name to discover Debian's GCC runtime.
-    CC_LINUX=/usr/bin/clang -target $(patsubst arm64,aarch64,$(ARCH))-linux-gnu -fuse-ld=lld -Wl,-strip-debug --sysroot $(shell realpath $(SYSROOT_LINUX)) -Wno-c23-extensions
+    CC_LINUX=/usr/bin/clang -target $(patsubst arm64,aarch64,$(ARCH))-linux-gnu -fuse-ld=lld -Wl,-strip-debug --sysroot $(abspath $(SYSROOT_LINUX)) -Wno-c23-extensions
 else
     # Build on Linux host
     CC_LINUX=$(CC)
