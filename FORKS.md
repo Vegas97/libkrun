@@ -153,6 +153,8 @@ commands, drains commands before disconnecting, validates JSON with
 - macOS virtiofs resolves a symlink root path before opening it with `O_NOFOLLOW`.
 - Unix datagram client paths include both the process ID and a per-NIC instance
   ID, preventing NICs in one process from unlinking each other's sockets.
+- macOS builds use the `aarch64` GNU target name so Clang finds the downloaded
+  Debian GCC runtime when compiling the Linux guest init.
 - The networking and balloon branches are combined without dropping either
   branch's changes. See [the build guide](docs/building-fork.md) for validation
   commands and files to regenerate after cloning.
