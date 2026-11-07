@@ -20,6 +20,8 @@ use std::cmp;
 use std::io::Write;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
+use std::thread::JoinHandle;
+use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
@@ -77,6 +79,8 @@ pub struct Net {
     acked_features: u64,
 
     pub(crate) device_state: DeviceState,
+    worker_thread: Option<JoinHandle<()>>,
+    worker_stopfd: EventFd,
 
     config: VirtioNetConfig,
 }
@@ -100,6 +104,11 @@ impl Net {
             max_virtqueue_pairs: 0,
         };
 
+        let worker_stopfd = EventFd::new(EFD_NONBLOCK).map_err(|e| {
+            log::error!("Failed to create worker stop eventfd: {e:?}");
+            super::Error::EventFd(e)
+        })?;
+
         Ok(Net {
             id,
             cfg_backend,
@@ -108,6 +117,8 @@ impl Net {
             acked_features: 0u64,
 
             device_state: DeviceState::Inactive,
+            worker_thread: None,
+            worker_stopfd,
             config,
         })
     }
@@ -181,6 +192,11 @@ impl VirtioDevice for Net {
             ActivateError::BadActivate
         })?;
 
+        let stop_fd = self.worker_stopfd.try_clone().map_err(|e| {
+            error!("Failed to clone worker stop eventfd: {e:?}");
+            ActivateError::BadActivate
+        })?;
+
         match NetWorker::new(
             rx_q,
             tx_q,
@@ -188,9 +204,13 @@ impl VirtioDevice for Net {
             mem.clone(),
             self.acked_features,
             self.cfg_backend.clone(),
+            stop_fd,
         ) {
             Ok(worker) => {
-                worker.run();
+                self.worker_thread = Some(worker.run().map_err(|e| {
+                    error!("Failed to spawn virtio-net worker thread: {e:?}");
+                    ActivateError::BadActivate
+                })?);
                 self.device_state = DeviceState::Activated(mem, interrupt);
                 Ok(())
             }
@@ -206,5 +226,16 @@ impl VirtioDevice for Net {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    fn reset(&mut self) -> bool {
+        if let Some(worker) = self.worker_thread.take() {
+            let _ = self.worker_stopfd.write(1);
+            if let Err(e) = worker.join() {
+                error!("virtio-net ({}): error waiting for worker thread: {e:?}", self.id);
+            }
+        }
+        self.device_state = DeviceState::Inactive;
+        true
     }
 }
