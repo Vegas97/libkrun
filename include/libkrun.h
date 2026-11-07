@@ -110,6 +110,22 @@ int32_t krun_set_vm_config(uint32_t ctx_id, uint8_t num_vcpus, uint32_t ram_mib)
 int32_t krun_set_root(uint32_t ctx_id, const char *root_path);
 
 /**
+ * Sets a read-only root filesystem for the microVM. Not available in libkrun-SEV.
+ *
+ * The FUSE server will reject all mutating operations (write, create, mkdir,
+ * unlink, rename, etc.) with EROFS at the VMM level. The guest kernel will
+ * mount the rootfs as read-only from boot.
+ *
+ * Arguments:
+ *  "ctx_id"    - the configuration context ID.
+ *  "root_path" - a null-terminated string representing the path to be used as root.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_root_ro(uint32_t ctx_id, const char *root_path);
+
+/**
  * DEPRECATED. Use krun_add_disk instead.
  *
  * Sets the path to the disk image that contains the file-system to be used as root for the microVM.
@@ -1225,6 +1241,69 @@ int32_t krun_set_root_disk_remount(uint32_t ctx_id, const char *device, const ch
  *  -EINVAL - The VMM has detected an error in the microVM configuration.
  */
 int32_t krun_start_enter(uint32_t ctx_id);
+
+/**
+ * Set initial balloon configuration before VM start.
+ * If not called, balloon is inactive (target = 0, no inflation).
+ *
+ * Arguments:
+ *  "ctx_id"         - the VM context ID.
+ *  "initial_target" - initial balloon target in number of 4KB pages to inflate at boot.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_balloon_config(uint32_t ctx_id, uint32_t initial_target);
+
+/**
+ * Set the balloon target size in number of 4KB pages at runtime.
+ * The guest will inflate (give back memory) or deflate (reclaim memory)
+ * to reach this target. Can only be called after krun_start_enter().
+ *
+ * Arguments:
+ *  "ctx_id"    - the VM context ID.
+ *  "num_pages" - target number of 4KB pages to balloon (0 = no balloon).
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_balloon_target(uint32_t ctx_id, uint32_t num_pages);
+
+/**
+ * Get current balloon statistics from the guest.
+ *
+ * Arguments:
+ *  "ctx_id" - the VM context ID.
+ *  "actual" - OUT: actual number of pages currently ballooned.
+ *  "target" - OUT: target number of pages (last set).
+ *  "free"   - OUT: free memory in guest (pages), or 0 if unavailable.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_get_balloon_stats(uint32_t ctx_id, uint32_t *actual,
+                                uint32_t *target, uint32_t *free);
+
+/**
+ * Set the path for a Unix control socket for runtime VM management.
+ * Must be called before krun_start_enter(). The socket accepts newline-
+ * delimited JSON commands for balloon control and other runtime operations.
+ *
+ * Supported commands:
+ *   {"cmd": "balloon_set", "target_mib": <uint>}
+ *   {"cmd": "balloon_stats"}
+ *
+ * The socket is chmod 0700, accepts one client at a time, and is
+ * automatically removed on clean shutdown.
+ *
+ * Arguments:
+ *  "ctx_id"      - the VM context ID.
+ *  "socket_path" - filesystem path for the Unix domain socket.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_control_socket(uint32_t ctx_id, const char *socket_path);
 
 #ifdef __cplusplus
 }

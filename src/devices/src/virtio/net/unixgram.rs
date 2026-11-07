@@ -5,7 +5,8 @@ use nix::sys::socket::{
 };
 use nix::unistd::unlink;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
 use super::write_virtio_net_hdr;
@@ -25,6 +26,13 @@ const SOCKET_SNDBUF: usize = MAX_BUFFER_SIZE - VNET_HDR_LEN;
 const SOCKET_SNDBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
 
 const SOCKET_RCVBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
+static NEXT_CLIENT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
+
+fn client_socket_path(server_path: &Path, instance_id: u64) -> PathBuf {
+    let mut path = server_path.as_os_str().to_os_string();
+    path.push(format!("-krun-{}-{instance_id}.sock", std::process::id()));
+    PathBuf::from(path)
+}
 
 pub struct Unixgram {
     fd: OwnedFd,
@@ -76,8 +84,9 @@ impl Unixgram {
         )
         .map_err(ConnectError::CreateSocket)?;
         let peer_addr = UnixAddr::new(&path).map_err(ConnectError::InvalidAddress)?;
-        let local_addr = UnixAddr::new(&PathBuf::from(format!("{}-krun.sock", path.display())))
-            .map_err(ConnectError::InvalidAddress)?;
+        let instance_id = NEXT_CLIENT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
+        let local_path = client_socket_path(&path, instance_id);
+        let local_addr = UnixAddr::new(&local_path).map_err(ConnectError::InvalidAddress)?;
         if let Some(path) = local_addr.path() {
             _ = unlink(path);
         }
@@ -169,5 +178,57 @@ impl NetBackend for Unixgram {
     #[cfg(target_os = "macos")]
     fn write_retry_delay_us(&self) -> u64 {
         50
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify the production client_socket_path() includes the PID for cross-process uniqueness.
+    #[test]
+    fn client_socket_path_contains_pid() {
+        let server_path = PathBuf::from("/tmp/test-gvproxy.sock");
+        let result = client_socket_path(&server_path, 42);
+        let pid = std::process::id();
+
+        assert!(
+            result
+                .to_str()
+                .unwrap()
+                .contains(&format!("-krun-{pid}-42.sock")),
+            "path must contain PID: {result:?}"
+        );
+    }
+
+    /// A NIC keeps the same path for a given instance ID.
+    #[test]
+    fn client_socket_path_is_deterministic() {
+        let server_path = PathBuf::from("/tmp/test-gvproxy.sock");
+
+        let path_a = client_socket_path(&server_path, 42);
+        let path_b = client_socket_path(&server_path, 42);
+
+        assert_eq!(path_a, path_b);
+    }
+
+    #[test]
+    fn multiple_nics_use_distinct_client_sockets() {
+        let id = NEXT_CLIENT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
+        let server_path = PathBuf::from(format!("/tmp/krun-net-{}-{id}.sock", std::process::id()));
+        let server = std::os::unix::net::UnixDatagram::bind(&server_path).unwrap();
+        let first = Unixgram::open(server_path.clone(), false).unwrap();
+        let second = Unixgram::open(server_path.clone(), false).unwrap();
+        let first_addr = nix::sys::socket::getsockname::<UnixAddr>(first.fd.as_raw_fd()).unwrap();
+        let second_addr = nix::sys::socket::getsockname::<UnixAddr>(second.fd.as_raw_fd()).unwrap();
+
+        assert_ne!(first_addr.path(), second_addr.path());
+        assert!(first_addr.path().unwrap().exists());
+        assert!(second_addr.path().unwrap().exists());
+
+        drop((first, second, server));
+        std::fs::remove_file(first_addr.path().unwrap()).unwrap();
+        std::fs::remove_file(second_addr.path().unwrap()).unwrap();
+        std::fs::remove_file(server_path).unwrap();
     }
 }

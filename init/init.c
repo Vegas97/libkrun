@@ -399,7 +399,7 @@ static int mount_filesystems()
     int i;
 
     for (i = 0; i < 3; ++i) {
-        if (mkdir(DIRS_LEVEL1[i], 0755) < 0 && errno != EEXIST) {
+        if (mkdir(DIRS_LEVEL1[i], 0755) < 0 && errno != EEXIST && errno != EROFS) {
             printf("Error creating directory (%s)\n", DIRS_LEVEL1[i]);
             return -1;
         }

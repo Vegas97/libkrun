@@ -105,6 +105,9 @@ When TSI is enabled, the VMM acts as a proxy for AF_INET, AF_INET6 and AF_UNIX s
 
 ## Building and installing
 
+For this fork's macOS build, test commands, and generated-file policy, see
+[Building this fork on another machine](docs/building-fork.md).
+
 ### Linux (generic variant)
 
 #### Requirements

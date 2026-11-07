@@ -517,6 +517,8 @@ pub struct Config {
     /// Table of exported FDs to share with other subsystems. Not supported for macos.
     pub export_table: Option<ExportTable>,
     pub allow_root_dir_delete: bool,
+    /// When true, the FUSE server rejects all mutating operations with EROFS.
+    pub read_only: bool,
 }
 
 impl Default for Config {
@@ -532,6 +534,7 @@ impl Default for Config {
             export_fsid: 0,
             export_table: None,
             allow_root_dir_delete: false,
+            read_only: false,
         }
     }
 }
@@ -560,7 +563,18 @@ pub struct PassthroughFs {
 }
 
 impl PassthroughFs {
-    pub fn new(cfg: Config) -> io::Result<PassthroughFs> {
+    pub fn new(mut cfg: Config) -> io::Result<PassthroughFs> {
+        // Resolve symlinks in root_dir so that subsequent openat() calls with
+        // O_NOFOLLOW don't fail with ELOOP when the path is a symlink
+        // (e.g. /tmp -> private/tmp on macOS).
+        cfg.root_dir = std::fs::canonicalize(&cfg.root_dir)
+            .map_err(linux_error)?
+            .to_str()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "root_dir is not valid UTF-8")
+            })?
+            .to_string();
+
         let root = CString::new(cfg.root_dir.as_str()).expect("CString::new failed");
 
         // Safe because this doesn't modify any memory and we check the return value.
@@ -2452,5 +2466,37 @@ impl FileSystem for PassthroughFs {
             }
             _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_resolves_a_symlink_root() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture =
+            std::env::temp_dir().join(format!("krun-root-{}-{unique}", std::process::id()));
+        let root = fixture.join("root");
+        let link = fixture.join("link");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+
+        let fs = PassthroughFs::new(Config {
+            root_dir: link.to_str().unwrap().to_owned(),
+            ..Config::default()
+        })
+        .unwrap();
+        assert_eq!(
+            std::path::Path::new(&fs.cfg.root_dir),
+            std::fs::canonicalize(root).unwrap()
+        );
+
+        drop(fs);
+        std::fs::remove_dir_all(fixture).unwrap();
     }
 }

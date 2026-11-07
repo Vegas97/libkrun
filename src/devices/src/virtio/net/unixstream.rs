@@ -164,7 +164,21 @@ impl NetBackend for Unixstream {
         let frame_length = self.expecting_frame_length as usize;
         self.read_loop(&mut buf[..frame_length], false)?;
         self.expecting_frame_length = 0;
-        log::trace!("Read eth frame from network proxy: {frame_length} bytes");
+
+        // Trace logging: frame length + Ethernet header (dst MAC, src MAC, ethertype)
+        if frame_length >= 14 {
+            log::debug!(
+                "RX frame: len={} dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} \
+                 src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ethertype={:02x}{:02x}",
+                frame_length,
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
+                buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+                buf[12], buf[13],
+            );
+        } else {
+            log::debug!("RX frame: len={} (too short for Ethernet header)", frame_length);
+        }
+
         Ok(hdr_len + frame_length)
     }
 

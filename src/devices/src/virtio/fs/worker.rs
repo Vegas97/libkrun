@@ -45,13 +45,14 @@ impl FsWorker {
         exit_code: Arc<AtomicI32>,
         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
     ) -> Self {
+        let read_only = passthrough_cfg.read_only;
         Self {
             queues,
             queue_evts,
             interrupt,
             mem,
             shm_region,
-            server: Server::new(PassthroughFs::new(passthrough_cfg).unwrap()),
+            server: Server::new(PassthroughFs::new(passthrough_cfg).unwrap(), read_only),
             stop_fd,
             exit_code,
             #[cfg(target_os = "macos")]
