@@ -3,7 +3,7 @@
 // Provides a Unix domain socket that accepts JSON commands for
 // balloon control and other runtime operations.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -12,10 +12,12 @@ use std::time::Instant;
 
 use devices::virtio::Balloon;
 use polly::event_manager::{EventManager, Subscriber};
+use serde_json::{json, Value};
 use utils::epoll::{EpollEvent, EventSet};
 
 /// Maximum commands per second before rate limiting kicks in.
 const RATE_LIMIT_MAX: usize = 10;
+const MAX_COMMAND_BYTES: usize = 4096;
 
 pub struct ControlSocket {
     listener: UnixListener,
@@ -28,8 +30,8 @@ pub struct ControlSocket {
 }
 
 struct ClientConn {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    stream: UnixStream,
+    recv_buf: Vec<u8>,
 }
 
 impl ControlSocket {
@@ -37,10 +39,7 @@ impl ControlSocket {
     ///
     /// Removes stale sockets, binds, sets permissions to 0700, and
     /// sets the listener to non-blocking mode.
-    pub fn new(
-        socket_path: &Path,
-        balloon: Option<Arc<Mutex<Balloon>>>,
-    ) -> std::io::Result<Self> {
+    pub fn new(socket_path: &Path, balloon: Option<Arc<Mutex<Balloon>>>) -> std::io::Result<Self> {
         // Remove stale socket if it exists. Only remove actual socket files —
         // refuse to delete regular files or symlinks to prevent misconfiguration damage.
         if socket_path.exists() {
@@ -102,7 +101,7 @@ impl ControlSocket {
             Ok((stream, _addr)) => {
                 // Drop existing client if any (single client at a time).
                 if let Some(old) = self.client.take() {
-                    let old_fd = old.reader.get_ref().as_raw_fd();
+                    let old_fd = old.stream.as_raw_fd();
                     let _ = event_manager.unregister(old_fd);
                 }
 
@@ -112,14 +111,6 @@ impl ControlSocket {
                 }
 
                 let client_fd = stream.as_raw_fd();
-                let writer = match stream.try_clone() {
-                    Ok(w) => w,
-                    Err(e) => {
-                        error!("control_socket: failed to clone stream: {e}");
-                        return;
-                    }
-                };
-
                 // Register client FD for reading.
                 let self_sub = match event_manager.subscriber(self.listener.as_raw_fd()) {
                     Ok(s) => s,
@@ -139,8 +130,8 @@ impl ControlSocket {
                 }
 
                 self.client = Some(ClientConn {
-                    reader: BufReader::new(stream),
-                    writer,
+                    stream,
+                    recv_buf: Vec::new(),
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -152,30 +143,44 @@ impl ControlSocket {
 
     /// Handle data from the connected client.
     ///
-    /// Loops `read_line()` until `WouldBlock` or EOF to drain any lines
-    /// buffered inside `BufReader` that epoll cannot see. On hangup events,
-    /// drains remaining data before disconnecting.
-    fn handle_client_data(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
-        let event_set = event.event_set();
-
-        // Track hangup — drain buffered data before disconnecting.
-        let hanging_up =
-            event_set.contains(EventSet::HANG_UP) || event_set.contains(EventSet::READ_HANG_UP);
-
-        // Drain all complete lines from the BufReader. We collect into a vec
-        // to release the mutable borrow on self.client before dispatching.
+    /// Retains fragmented commands across reads and drains data before
+    /// disconnecting at EOF, including when a hangup accompanies readable data.
+    fn handle_client_data(&mut self, _event: &EpollEvent, event_manager: &mut EventManager) {
         let mut lines = Vec::new();
         let mut should_disconnect = false;
+        let mut command_too_long = false;
 
         if let Some(client) = self.client.as_mut() {
-            loop {
-                let mut line = String::new();
-                match client.reader.read_line(&mut line) {
+            let mut buffer = [0; MAX_COMMAND_BYTES];
+            'drain: loop {
+                match client.stream.read(&mut buffer) {
                     Ok(0) => {
+                        // EOF also terminates a final command without a newline.
+                        if !client.recv_buf.is_empty() {
+                            lines.push(std::mem::take(&mut client.recv_buf));
+                        }
                         should_disconnect = true;
                         break;
                     }
-                    Ok(_) => lines.push(line),
+                    Ok(len) => {
+                        for &byte in &buffer[..len] {
+                            if byte == b'\n' {
+                                lines.push(std::mem::take(&mut client.recv_buf));
+                                // Bound work and memory even if a client floods commands.
+                                if lines.len() > RATE_LIMIT_MAX {
+                                    should_disconnect = true;
+                                    break 'drain;
+                                }
+                            } else if client.recv_buf.len() >= MAX_COMMAND_BYTES {
+                                command_too_long = true;
+                                should_disconnect = true;
+                                break 'drain;
+                            } else {
+                                client.recv_buf.push(byte);
+                            }
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) => {
                         error!("control_socket: read error: {e}");
@@ -198,54 +203,68 @@ impl ControlSocket {
             self.rate_count += 1;
             if self.rate_count > RATE_LIMIT_MAX {
                 self.send_response(r#"{"ok":false,"error":"rate limit exceeded"}"#);
-                return;
+                should_disconnect = true;
+                break;
             }
 
-            let response = self.dispatch_command(line.trim());
+            let response = match std::str::from_utf8(line) {
+                Ok(line) => self.dispatch_command(line.trim()),
+                Err(_) => r#"{"ok":false,"error":"invalid JSON"}"#.to_string(),
+            };
             self.send_response(&response);
         }
 
-        if should_disconnect || (hanging_up && lines.is_empty()) {
+        if command_too_long {
+            self.send_response(r#"{"ok":false,"error":"command too long"}"#);
+        }
+        if should_disconnect {
             self.disconnect_client(event_manager);
         }
     }
 
     fn send_response(&mut self, response: &str) {
         if let Some(ref mut client) = self.client {
-            let _ = writeln!(client.writer, "{response}");
-            let _ = client.writer.flush();
+            let _ = writeln!(client.stream, "{response}");
+            let _ = client.stream.flush();
         }
     }
 
     fn disconnect_client(&mut self, event_manager: &mut EventManager) {
         if let Some(client) = self.client.take() {
-            let fd = client.reader.get_ref().as_raw_fd();
+            let fd = client.stream.as_raw_fd();
             let _ = event_manager.unregister(fd);
         }
     }
 
     /// Parse and dispatch a JSON command line.
     fn dispatch_command(&self, line: &str) -> String {
-        // Minimal JSON parsing for our simple protocol.
-        let cmd = match extract_string_field(line, "cmd") {
+        let command: Value = match serde_json::from_str(line) {
+            Ok(command) => command,
+            Err(_) => return r#"{"ok":false,"error":"invalid JSON"}"#.to_string(),
+        };
+        let cmd = match command.get("cmd").and_then(Value::as_str) {
             Some(c) => c,
             None => return r#"{"ok":false,"error":"missing or invalid 'cmd' field"}"#.to_string(),
         };
 
-        match cmd.as_str() {
-            "balloon_set" => self.cmd_balloon_set(line),
+        match cmd {
+            "balloon_set" => self.cmd_balloon_set(&command),
             "balloon_stats" => self.cmd_balloon_stats(),
             _ => r#"{"ok":false,"error":"unknown command"}"#.to_string(),
         }
     }
 
-    fn cmd_balloon_set(&self, line: &str) -> String {
+    fn cmd_balloon_set(&self, command: &Value) -> String {
         let balloon = match self.balloon.as_ref() {
             Some(b) => b,
             None => return r#"{"ok":false,"error":"balloon device not configured"}"#.to_string(),
         };
 
-        let target_mib = match extract_u32_field(line, "target_mib") {
+        let target_mib = match command
+            .get("target_mib")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+        {
             Some(v) => v,
             None => {
                 return r#"{"ok":false,"error":"missing or invalid 'target_mib' field"}"#
@@ -256,9 +275,7 @@ impl ControlSocket {
         // Convert MiB to 4KB pages (checked to prevent overflow).
         let pages = match target_mib.checked_mul(256) {
             Some(p) => p,
-            None => {
-                return r#"{"ok":false,"error":"target_mib too large"}"#.to_string()
-            }
+            None => return r#"{"ok":false,"error":"target_mib too large"}"#.to_string(),
         };
         balloon.lock().unwrap().set_num_pages(pages);
 
@@ -279,9 +296,8 @@ impl ControlSocket {
         let actual_mib = actual_pages / 256;
         let target_mib = target_pages / 256;
 
-        format!(
-            r#"{{"ok":true,"actual_mib":{actual_mib},"target_mib":{target_mib},"free_mib":0}}"#
-        )
+        json!({"ok": true, "actual_mib": actual_mib, "target_mib": target_mib, "free_mib": 0})
+            .to_string()
     }
 }
 
@@ -294,7 +310,7 @@ impl Subscriber for ControlSocket {
         } else if self
             .client
             .as_ref()
-            .is_some_and(|c| c.reader.get_ref().as_raw_fd() == source)
+            .is_some_and(|c| c.stream.as_raw_fd() == source)
         {
             self.handle_client_data(event, event_manager);
         } else {
@@ -318,99 +334,123 @@ impl Drop for ControlSocket {
     }
 }
 
-// --- Minimal JSON field extraction (no serde dependency) ---
-
-/// Extract a string value for the given key from a JSON object string.
-/// Handles: {"key": "value", ...}
-fn extract_string_field(json: &str, key: &str) -> Option<String> {
-    let pattern = format!(r#""{}""#, key);
-    let key_pos = json.find(&pattern)?;
-    let after_key = &json[key_pos + pattern.len()..];
-
-    // Skip whitespace and colon.
-    let after_colon = after_key.trim_start().strip_prefix(':')?;
-    let trimmed = after_colon.trim_start();
-
-    if trimmed.starts_with('"') {
-        let content = &trimmed[1..];
-        let end = content.find('"')?;
-        Some(content[..end].to_string())
-    } else {
-        None
-    }
-}
-
-/// Extract a u32 value for the given key from a JSON object string.
-/// Handles: {"key": 123, ...}
-fn extract_u32_field(json: &str, key: &str) -> Option<u32> {
-    let pattern = format!(r#""{}""#, key);
-    let key_pos = json.find(&pattern)?;
-    let after_key = &json[key_pos + pattern.len()..];
-
-    let after_colon = after_key.trim_start().strip_prefix(':')?;
-    let trimmed = after_colon.trim_start();
-
-    // Parse digits until non-digit.
-    let end = trimmed
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(trimmed.len());
-    if end == 0 {
-        return None;
-    }
-    // Reject floats (123.5) and exponent notation (1e2, 1E10).
-    if let Some(next) = trimmed[end..].chars().next() {
-        if next == '.' || next == 'e' || next == 'E' {
-            return None;
-        }
-    }
-    trimmed[..end].parse().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
+    use std::net::Shutdown;
 
     #[test]
-    fn test_extract_string_field() {
-        let json = r#"{"cmd": "balloon_set", "target_mib": 128}"#;
-        assert_eq!(
-            extract_string_field(json, "cmd"),
-            Some("balloon_set".to_string())
-        );
-        assert_eq!(extract_string_field(json, "target_mib"), None);
-        assert_eq!(extract_string_field(json, "missing"), None);
+    fn test_dispatch_rejects_invalid_numbers_and_json() {
+        let path = std::env::temp_dir().join("test_ctrl_json.sock");
+        let balloon = Arc::new(Mutex::new(Balloon::new().unwrap()));
+        let cs = ControlSocket::new(&path, Some(balloon.clone())).unwrap();
+        for value in [
+            "123.5",
+            "1e2",
+            "1E10",
+            "-1",
+            "4294967296",
+            "12garbage",
+            "01",
+            "true",
+            "\"64\"",
+        ] {
+            let request = format!(r#"{{"cmd":"balloon_set","target_mib":{value}}}"#);
+            let response: Value = serde_json::from_str(&cs.dispatch_command(&request)).unwrap();
+            assert_eq!(response["ok"], false, "accepted {value}");
+            assert_eq!(balloon.lock().unwrap().num_pages(), 0);
+        }
+        let response: Value = serde_json::from_str(
+            &cs.dispatch_command(r#"{"cmd":"balloon_\u0073et","target_mib":0}"#),
+        )
+        .unwrap();
+        assert_eq!(response["ok"], true);
+    }
+
+    fn socket_with_client(name: &str) -> (ControlSocket, UnixStream, EventManager, EpollEvent) {
+        let path = std::env::temp_dir().join(format!("test_ctrl_{name}.sock"));
+        let mut cs = ControlSocket::new(&path, None).unwrap();
+        let (stream, peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let event = EpollEvent::new(EventSet::IN, stream.as_raw_fd() as u64);
+        cs.client = Some(ClientConn {
+            stream,
+            recv_buf: Vec::new(),
+        });
+        (cs, peer, EventManager::new().unwrap(), event)
     }
 
     #[test]
-    fn test_extract_u32_field() {
-        let json = r#"{"cmd": "balloon_set", "target_mib": 128}"#;
-        assert_eq!(extract_u32_field(json, "target_mib"), Some(128));
-        assert_eq!(extract_u32_field(json, "cmd"), None);
-        assert_eq!(extract_u32_field(json, "missing"), None);
+    fn test_fragmented_command_survives_would_block() {
+        let (mut cs, mut peer, mut manager, event) = socket_with_client("fragmented");
+        peer.write_all(br#"{"cmd":"balloon_"#).unwrap();
+        cs.handle_client_data(&event, &mut manager);
+        assert_eq!(cs.rate_count, 0);
+        assert!(!cs.client.as_ref().unwrap().recv_buf.is_empty());
+
+        peer.write_all(b"stats\"}\n").unwrap();
+        cs.handle_client_data(&event, &mut manager);
+        let mut response = String::new();
+        std::io::BufReader::new(peer)
+            .read_line(&mut response)
+            .unwrap();
+        assert!(response.contains("balloon device not configured"));
+        assert_eq!(cs.rate_count, 1);
+        assert!(cs.client.as_ref().unwrap().recv_buf.is_empty());
     }
 
     #[test]
-    fn test_extract_u32_zero() {
-        let json = r#"{"target_mib": 0}"#;
-        assert_eq!(extract_u32_field(json, "target_mib"), Some(0));
+    fn test_multiple_commands_are_drained_before_eof() {
+        let (mut cs, mut peer, mut manager, event) = socket_with_client("drain");
+        peer.write_all(b"{\"cmd\":\"balloon_stats\"}\n{\"cmd\":\"reboot\"}\n")
+            .unwrap();
+        peer.shutdown(Shutdown::Write).unwrap();
+        let event = EpollEvent::new(EventSet::IN | EventSet::READ_HANG_UP, event.data());
+        cs.handle_client_data(&event, &mut manager);
+
+        let responses: Vec<String> = std::io::BufReader::new(peer)
+            .lines()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert!(responses[0].contains("balloon device not configured"));
+        assert!(responses[1].contains("unknown command"));
+        assert!(cs.client.is_none());
     }
 
     #[test]
-    fn test_extract_u32_rejects_float() {
-        let json = r#"{"target_mib": 123.5}"#;
-        assert_eq!(extract_u32_field(json, "target_mib"), None);
+    fn test_overlong_command_disconnects_client() {
+        let (mut cs, mut peer, mut manager, event) = socket_with_client("overlong");
+        peer.write_all(&vec![b'x'; MAX_COMMAND_BYTES + 1]).unwrap();
+        cs.handle_client_data(&event, &mut manager);
+        let mut response = String::new();
+        std::io::BufReader::new(peer)
+            .read_line(&mut response)
+            .unwrap();
+        assert!(response.contains("command too long"));
+        assert!(cs.client.is_none());
     }
 
     #[test]
-    fn test_extract_u32_rejects_exponent() {
-        assert_eq!(
-            extract_u32_field(r#"{"target_mib": 1e2}"#, "target_mib"),
-            None
-        );
-        assert_eq!(
-            extract_u32_field(r#"{"target_mib": 1E10}"#, "target_mib"),
-            None
-        );
+    fn test_command_flood_is_rate_limited_and_disconnected() {
+        let (mut cs, mut peer, mut manager, event) = socket_with_client("flood");
+        peer.write_all(
+            b"{\"cmd\":\"balloon_stats\"}\n"
+                .repeat(RATE_LIMIT_MAX + 1)
+                .as_slice(),
+        )
+        .unwrap();
+        cs.handle_client_data(&event, &mut manager);
+        let responses: Vec<String> = std::io::BufReader::new(peer)
+            .lines()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(responses.len(), RATE_LIMIT_MAX + 1);
+        assert!(responses.last().unwrap().contains("rate limit exceeded"));
+        assert!(cs.client.is_none());
     }
 
     #[test]
@@ -516,8 +556,7 @@ mod tests {
         let cs = ControlSocket::new(&socket_path, Some(balloon.clone())).unwrap();
 
         // u32::MAX * 256 would overflow. Should return error, not wrap.
-        let resp =
-            cs.dispatch_command(r#"{"cmd": "balloon_set", "target_mib": 4294967295}"#);
+        let resp = cs.dispatch_command(r#"{"cmd": "balloon_set", "target_mib": 4294967295}"#);
         assert!(resp.contains("target_mib too large"));
         // Balloon target should be unchanged (0).
         assert_eq!(balloon.lock().unwrap().num_pages(), 0);

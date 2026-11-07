@@ -230,9 +230,17 @@ impl VirtioDevice for Net {
 
     fn reset(&mut self) -> bool {
         if let Some(worker) = self.worker_thread.take() {
-            let _ = self.worker_stopfd.write(1);
+            if let Err(e) = self.worker_stopfd.write(1) {
+                error!(
+                    "virtio-net ({}): failed to signal worker stop: {e:?}",
+                    self.id
+                );
+            }
             if let Err(e) = worker.join() {
-                error!("virtio-net ({}): error waiting for worker thread: {e:?}", self.id);
+                error!(
+                    "virtio-net ({}): error waiting for worker thread: {e:?}",
+                    self.id
+                );
             }
         }
         self.device_state = DeviceState::Inactive;
